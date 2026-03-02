@@ -446,7 +446,7 @@ export function BuilderPane() {
               ))}
             </div>
             
-            <div className="ag-theme-alpine flex-1 w-full rounded-lg overflow-hidden border border-slate-200">
+            <div className="ag-theme-alpine w-full rounded-lg overflow-hidden border border-slate-200" style={{ height: isFullscreen ? 'calc(100vh - 150px)' : '500px' }}>
               <AgGridReact
                 rowData={queryResult}
                 columnDefs={columnDefs}
