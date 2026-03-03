@@ -229,8 +229,9 @@ def test_llm():
             headers = {}
             if data.get("apiKey"):
                 headers["Authorization"] = f"Bearer {data['apiKey']}"
+            base_url = (data.get("httpUrl") or "http://localhost:8000").rstrip("/")
             resp = _http_get(
-                f"{data['httpUrl']}/v1/models", headers=headers, timeout=10
+                f"{base_url}/v1/models", headers=headers, timeout=10
             )
             if not resp.ok:
                 raise Exception(f"HTTP error: {resp.status_code}")
@@ -255,8 +256,9 @@ def get_llm_models():
             headers = {}
             if llm_config.get("apiKey"):
                 headers["Authorization"] = f"Bearer {llm_config['apiKey']}"
+            base_url = (llm_config.get("httpUrl") or "http://localhost:8000").rstrip("/")
             resp = _http_get(
-                f"{llm_config['httpUrl']}/v1/models", headers=headers, timeout=10
+                f"{base_url}/v1/models", headers=headers, timeout=10
             )
             if not resp.ok:
                 raise Exception(f"HTTP error: {resp.status_code}")
@@ -498,13 +500,14 @@ def chat():
             if llm_config.get("apiKey"):
                 headers["Authorization"] = f"Bearer {llm_config['apiKey']}"
 
+            base_url = (llm_config.get("httpUrl") or "http://localhost:8000").rstrip("/")
             resp = _http_post(
-                f"{llm_config['httpUrl']}/v1/chat/completions",
+                f"{base_url}/v1/chat/completions",
                 json={
-                    "model": llm_config["model"],
+                    "model": llm_config.get("model") or "local-model",
                     "messages": [{"role": "system", "content": system_prompt}]
                     + formatted_messages,
-                    "response_format": {"type": "json_object"},
+                    "temperature": 0.7,
                 },
                 headers=headers,
                 timeout=120,
@@ -514,7 +517,12 @@ def chat():
                 raise Exception(f"HTTP LLM Error: {resp.status_code} - {resp.text}")
 
             resp_data = resp.json()
-            content = resp_data["choices"][0]["message"]["content"]
+            # Flexible content extraction — compatible with LocalAI, LM Studio, Ollama /v1, etc.
+            content = (
+                resp_data.get("choices", [{}])[0].get("message", {}).get("content")
+                or resp_data.get("content")
+                or ""
+            )
             content = content.replace("```json", "").replace("```", "").strip()
             return jsonify(json.loads(content))
 
