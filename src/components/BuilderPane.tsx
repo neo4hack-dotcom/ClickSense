@@ -21,7 +21,7 @@ import {
   useSortable
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { GripVertical, X, Table, BarChart2, PieChart, LineChart, Play, Save, Sparkles, Star, RefreshCw, Maximize2, Minimize2, Palette, ArrowUp, ArrowDown, Filter, RotateCcw, Search } from 'lucide-react';
+import { GripVertical, X, Table, BarChart2, PieChart, LineChart, Play, Save, Sparkles, Star, RefreshCw, Maximize2, Minimize2, Palette, ArrowUp, ArrowDown, Filter, RotateCcw, Search, Plus } from 'lucide-react';
 import { 
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, ResponsiveContainer,
   LineChart as RechartsLineChart, Line, PieChart as RechartsPieChart, Pie, Cell
@@ -145,6 +145,16 @@ export function BuilderPane() {
   
   const [fieldSearch, setFieldSearch] = useState('');
 
+  // Row/Column dimension split
+  const [rowDims, setRowDims] = useState<{name: string}[]>([]);
+  const [colDims, setColDims] = useState<{name: string}[]>([]);
+
+  // Pre-query WHERE filters
+  const [preFilters, setPreFilters] = useState<{id: string, column: string, operator: string, value: string}[]>([]);
+
+  // Output limit
+  const [queryLimit, setQueryLimit] = useState<string>('100');
+
   // Custom Table State
   const [sortConfig, setSortConfig] = useState<{ key: string, direction: 'asc' | 'desc' } | null>(null);
   const [filters, setFilters] = useState<Record<string, string>>({});
@@ -210,20 +220,21 @@ export function BuilderPane() {
 
   // Visualization Recommendation Engine
   useEffect(() => {
-    const dims = queryConfig.dimensions.length;
+    const allDims = [...rowDims, ...colDims];
+    const dims = allDims.length;
     const meas = queryConfig.measures.length;
-    
+
     if (dims === 0 && meas === 0) {
       setSuggestedVisual(null);
       return;
     }
 
     if (dims === 1 && meas >= 1) {
-      const dimName = (queryConfig.dimensions[0] as any).name.toLowerCase();
+      const dimName = allDims[0].name.toLowerCase();
       if (dimName.includes('date') || dimName.includes('time') || dimName.includes('day') || dimName.includes('month') || dimName.includes('year')) {
         setSuggestedVisual('line');
       } else if (meas === 1 && (queryConfig.measures[0] as any).agg === 'count') {
-        setSuggestedVisual('bar'); // Or pie if few categories, but bar is safer
+        setSuggestedVisual('bar');
       } else {
         setSuggestedVisual('bar');
       }
@@ -232,7 +243,7 @@ export function BuilderPane() {
     } else {
       setSuggestedVisual('table');
     }
-  }, [queryConfig]);
+  }, [rowDims, colDims, queryConfig.measures]);
 
   const handleApplySuggestion = () => {
     if (suggestedVisual) {
@@ -264,6 +275,10 @@ export function BuilderPane() {
     setColumnOrder([]);
     setColumnColors({});
     setSuggestedVisual(null);
+    setRowDims([]);
+    setColDims([]);
+    setPreFilters([]);
+    setQueryLimit('100');
   };
 
   const sensors = useSensors(
@@ -273,7 +288,7 @@ export function BuilderPane() {
     })
   );
 
-  const handleDragEnd = (event: DragEndEvent, type: 'dimensions' | 'measures' | 'columns') => {
+  const handleDragEnd = (event: DragEndEvent, type: 'rowDims' | 'colDims' | 'measures' | 'columns') => {
     const { active, over } = event;
     if (!over || active.id === over.id) {
       setActiveDragColumn(null);
@@ -285,13 +300,20 @@ export function BuilderPane() {
       const newIndex = columnOrder.indexOf(over.id as string);
       setColumnOrder(arrayMove(columnOrder, oldIndex, newIndex));
       setActiveDragColumn(null);
-    } else {
-      const oldIndex = queryConfig[type].findIndex((i: any) => (i.name || i.column) === active.id);
-      const newIndex = queryConfig[type].findIndex((i: any) => (i.name || i.column) === over.id);
-      
+    } else if (type === 'rowDims') {
+      const oldIndex = rowDims.findIndex(i => i.name === active.id);
+      const newIndex = rowDims.findIndex(i => i.name === over.id);
+      setRowDims(arrayMove(rowDims, oldIndex, newIndex));
+    } else if (type === 'colDims') {
+      const oldIndex = colDims.findIndex(i => i.name === active.id);
+      const newIndex = colDims.findIndex(i => i.name === over.id);
+      setColDims(arrayMove(colDims, oldIndex, newIndex));
+    } else if (type === 'measures') {
+      const oldIndex = queryConfig.measures.findIndex((i: any) => i.column === active.id);
+      const newIndex = queryConfig.measures.findIndex((i: any) => i.column === over.id);
       setQueryConfig({
         ...queryConfig,
-        [type]: arrayMove(queryConfig[type] as any[], oldIndex, newIndex),
+        measures: arrayMove(queryConfig.measures as any[], oldIndex, newIndex),
       });
     }
   };
@@ -300,11 +322,23 @@ export function BuilderPane() {
     setActiveDragColumn(event.active.id);
   };
 
-  const addDimension = (col: string) => {
-    if (!queryConfig.dimensions.find((d: any) => d.name === col)) {
-      setQueryConfig({ ...queryConfig, dimensions: [...queryConfig.dimensions, { name: col }] });
+  const addRowDimension = (col: string) => {
+    if (!rowDims.find(d => d.name === col) && !colDims.find(d => d.name === col)) {
+      const newRowDims = [...rowDims, { name: col }];
+      setRowDims(newRowDims);
+      setQueryConfig({ ...queryConfig, dimensions: [...newRowDims, ...colDims] });
     }
   };
+
+  const addColDimension = (col: string) => {
+    if (!colDims.find(d => d.name === col) && !rowDims.find(d => d.name === col)) {
+      const newColDims = [...colDims, { name: col }];
+      setColDims(newColDims);
+      setQueryConfig({ ...queryConfig, dimensions: [...rowDims, ...newColDims] });
+    }
+  };
+
+  const addDimension = (col: string) => addRowDimension(col);
 
   const addMeasure = (col: string, agg: string = 'count') => {
     if (!queryConfig.measures.find((m: any) => m.column === col && m.agg === agg)) {
@@ -312,11 +346,21 @@ export function BuilderPane() {
     }
   };
 
+  const removeRowDimension = (col: string) => {
+    const newRowDims = rowDims.filter(d => d.name !== col);
+    setRowDims(newRowDims);
+    setQueryConfig({ ...queryConfig, dimensions: [...newRowDims, ...colDims] });
+  };
+
+  const removeColDimension = (col: string) => {
+    const newColDims = colDims.filter(d => d.name !== col);
+    setColDims(newColDims);
+    setQueryConfig({ ...queryConfig, dimensions: [...rowDims, ...newColDims] });
+  };
+
   const removeDimension = (col: string) => {
-    setQueryConfig({
-      ...queryConfig,
-      dimensions: queryConfig.dimensions.filter((d: any) => d.name !== col)
-    });
+    removeRowDimension(col);
+    removeColDimension(col);
   };
 
   const removeMeasure = (col: string, agg: string) => {
@@ -326,39 +370,63 @@ export function BuilderPane() {
     });
   };
 
+  const addPreFilter = () => {
+    setPreFilters(prev => [...prev, { id: Date.now().toString(), column: '', operator: '=', value: '' }]);
+  };
+
+  const updatePreFilter = (id: string, field: string, val: string) => {
+    setPreFilters(prev => prev.map(f => f.id === id ? { ...f, [field]: val } : f));
+  };
+
+  const removePreFilter = (id: string) => {
+    setPreFilters(prev => prev.filter(f => f.id !== id));
+  };
+
+  const buildSql = () => {
+    const table = selectedTable;
+    if (!table) throw new Error("No table selected");
+    const allDims = [...rowDims, ...colDims];
+    const selects = [
+      ...allDims.map(d => d.name),
+      ...queryConfig.measures.map((m: any) => m.column === '*' ? `count(*) AS count_all` : `${m.agg}(${m.column}) AS ${m.agg}_${m.column}`)
+    ];
+    let sql = `SELECT ${selects.join(', ')} FROM ${table}`;
+    const whereConditions = preFilters
+      .filter(f => f.column && f.operator && (f.value !== '' || f.operator === 'IS NULL' || f.operator === 'IS NOT NULL'))
+      .map(f => {
+        if (f.operator === 'IS NULL') return `${f.column} IS NULL`;
+        if (f.operator === 'IS NOT NULL') return `${f.column} IS NOT NULL`;
+        const isLike = f.operator === 'LIKE' || f.operator === 'NOT LIKE';
+        const isNum = !isLike && f.value !== '' && !isNaN(Number(f.value));
+        const val = isNum ? f.value : `'${f.value.replace(/'/g, "''")}'`;
+        return `${f.column} ${f.operator} ${val}`;
+      });
+    if (whereConditions.length > 0) sql += ` WHERE ${whereConditions.join(' AND ')}`;
+    if (allDims.length > 0 && queryConfig.measures.length > 0) {
+      sql += ` GROUP BY ${allDims.map(d => d.name).join(', ')}`;
+    }
+    const lim = parseInt(queryLimit, 10);
+    if (!isNaN(lim) && lim > 0) sql += ` LIMIT ${lim}`;
+    return sql;
+  };
+
   const buildAndExecuteQuery = async () => {
-    if (queryConfig.dimensions.length === 0 && queryConfig.measures.length === 0) return;
+    const allDims = [...rowDims, ...colDims];
+    if (allDims.length === 0 && queryConfig.measures.length === 0) return;
     setIsExecuting(true);
 
     try {
-      // Very basic SQL builder for demo purposes
-      // In a real app, you'd need to know the table name.
-      // We assume the first table in schema for now, or require user to select it.
-      const table = selectedTable;
-      if (!table) throw new Error("No table selected");
-
-      const selects = [
-        ...queryConfig.dimensions.map((d: any) => d.name),
-        ...queryConfig.measures.map((m: any) => m.column === '*' ? `count(*) AS count_all` : `${m.agg}(${m.column}) AS ${m.agg}_${m.column}`)
-      ];
-
-      let sql = `SELECT ${selects.join(', ')} FROM ${table}`;
-      
-      if (queryConfig.dimensions.length > 0 && queryConfig.measures.length > 0) {
-        sql += ` GROUP BY ${queryConfig.dimensions.map((d: any) => d.name).join(', ')}`;
-      }
-      
-      sql += ` LIMIT 100`;
+      const sql = buildSql();
 
       const res = await fetch('/api/query', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query: sql }),
       });
-      
+
       const data = await res.json();
       if (data.error) throw new Error(data.error);
-      
+
       setQueryResult(data.data);
 
       // Save to history
@@ -384,18 +452,7 @@ export function BuilderPane() {
 
     setIsSaving(true);
     try {
-      const table = selectedTable;
-      if (!table) throw new Error("No table selected");
-
-      const selects = [
-        ...queryConfig.dimensions.map((d: any) => d.name),
-        ...queryConfig.measures.map((m: any) => m.column === '*' ? `count(*) AS count_all` : `${m.agg}(${m.column}) AS ${m.agg}_${m.column}`)
-      ];
-      let sql = `SELECT ${selects.join(', ')} FROM ${table}`;
-      if (queryConfig.dimensions.length > 0 && queryConfig.measures.length > 0) {
-        sql += ` GROUP BY ${queryConfig.dimensions.map((d: any) => d.name).join(', ')}`;
-      }
-      sql += ` LIMIT 100`;
+      const sql = buildSql();
 
       await fetch('/api/saved_queries', {
         method: 'POST',
@@ -436,7 +493,7 @@ export function BuilderPane() {
 
     const keys = columnOrder.length > 0 ? columnOrder : Object.keys(queryResult[0]);
     // Try to guess dimension vs measure
-    const dimKey = (queryConfig.dimensions[0] as any)?.name || keys[0];
+    const dimKey = rowDims[0]?.name || colDims[0]?.name || keys[0];
     const measureKeys = keys.filter(k => k !== dimKey);
 
     // Apply sorting and filtering
@@ -745,7 +802,7 @@ export function BuilderPane() {
             </button>
             <button
               onClick={buildAndExecuteQuery}
-              disabled={isExecuting || (queryConfig.dimensions.length === 0 && queryConfig.measures.length === 0)}
+              disabled={isExecuting || ([...rowDims, ...colDims].length === 0 && queryConfig.measures.length === 0)}
               className="flex items-center gap-2 bg-emerald-500 hover:bg-emerald-600 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
             >
               <Play size={16} />
@@ -754,21 +811,44 @@ export function BuilderPane() {
           </div>
         </div>
 
-        <div className="grid grid-cols-2 gap-3">
-          {/* Dimensions Dropzone */}
+        {/* Dimensions + Measures — 3 columns */}
+        <div className="grid grid-cols-3 gap-3">
+          {/* Rows Dropzone */}
           <div className="bg-slate-50 border border-slate-200 rounded-xl p-3">
-            <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Dimensions (Rows/Columns)</div>
-            <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={(e) => handleDragEnd(e, 'dimensions')}>
-              <SortableContext items={queryConfig.dimensions.map((d: any) => d.name)} strategy={verticalListSortingStrategy}>
-                {/* max-h caps growth when many fields are added, preventing the results area from being pushed off-screen */}
-                <div className="min-h-[40px] max-h-28 overflow-y-auto flex flex-wrap gap-2 pr-0.5">
-                  {queryConfig.dimensions.length === 0 && (
+            <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2 flex items-center gap-1">
+              <span className="w-2 h-2 rounded-full bg-emerald-400 inline-block"></span> Rows
+            </div>
+            <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={(e) => handleDragEnd(e, 'rowDims')}>
+              <SortableContext items={rowDims.map(d => d.name)} strategy={verticalListSortingStrategy}>
+                <div className="min-h-[40px] max-h-24 overflow-y-auto flex flex-wrap gap-2 pr-0.5">
+                  {rowDims.length === 0 && (
                     <div className="text-sm text-slate-400 italic w-full text-center py-2 border-2 border-dashed border-slate-200 rounded-lg">
                       Drag fields here
                     </div>
                   )}
-                  {queryConfig.dimensions.map((dim: any) => (
-                    <SortableItem key={dim.name} id={dim.name} item={dim} onRemove={() => removeDimension(dim.name)} />
+                  {rowDims.map((dim) => (
+                    <SortableItem key={dim.name} id={dim.name} item={dim} onRemove={() => removeRowDimension(dim.name)} />
+                  ))}
+                </div>
+              </SortableContext>
+            </DndContext>
+          </div>
+
+          {/* Columns Dropzone */}
+          <div className="bg-slate-50 border border-purple-200 rounded-xl p-3">
+            <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2 flex items-center gap-1">
+              <span className="w-2 h-2 rounded-full bg-purple-400 inline-block"></span> Columns
+            </div>
+            <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={(e) => handleDragEnd(e, 'colDims')}>
+              <SortableContext items={colDims.map(d => d.name)} strategy={verticalListSortingStrategy}>
+                <div className="min-h-[40px] max-h-24 overflow-y-auto flex flex-wrap gap-2 pr-0.5">
+                  {colDims.length === 0 && (
+                    <div className="text-sm text-slate-400 italic w-full text-center py-2 border-2 border-dashed border-purple-100 rounded-lg">
+                      Drag fields here
+                    </div>
+                  )}
+                  {colDims.map((dim) => (
+                    <SortableItem key={dim.name} id={dim.name} item={dim} onRemove={() => removeColDimension(dim.name)} />
                   ))}
                 </div>
               </SortableContext>
@@ -777,10 +857,12 @@ export function BuilderPane() {
 
           {/* Measures Dropzone */}
           <div className="bg-slate-50 border border-slate-200 rounded-xl p-3">
-            <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Measures (Values)</div>
+            <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2 flex items-center gap-1">
+              <span className="w-2 h-2 rounded-full bg-blue-400 inline-block"></span> Measures (Values)
+            </div>
             <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={(e) => handleDragEnd(e, 'measures')}>
               <SortableContext items={queryConfig.measures.map((m: any) => m.column)} strategy={verticalListSortingStrategy}>
-                <div className="min-h-[40px] max-h-28 overflow-y-auto flex flex-wrap gap-2 pr-0.5">
+                <div className="min-h-[40px] max-h-24 overflow-y-auto flex flex-wrap gap-2 pr-0.5">
                   {queryConfig.measures.length === 0 && (
                     <div className="text-sm text-slate-400 italic w-full text-center py-2 border-2 border-dashed border-slate-200 rounded-lg">
                       Drag fields here
@@ -792,6 +874,63 @@ export function BuilderPane() {
                 </div>
               </SortableContext>
             </DndContext>
+          </div>
+        </div>
+
+        {/* Filters + Limit row */}
+        <div className="flex flex-wrap items-center gap-2 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2">
+          <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider shrink-0">WHERE</span>
+          {preFilters.map(f => (
+            <div key={f.id} className="flex items-center gap-1 bg-white border border-slate-200 rounded-lg px-2 py-1 shadow-sm">
+              <select
+                value={f.column}
+                onChange={e => updatePreFilter(f.id, 'column', e.target.value)}
+                className="text-xs border-none outline-none bg-transparent text-slate-700 max-w-[110px] cursor-pointer"
+              >
+                <option value="">column…</option>
+                {selectedTable && schema[selectedTable]?.map((col: any) => (
+                  <option key={col.name} value={col.name}>{col.name}</option>
+                ))}
+              </select>
+              <select
+                value={f.operator}
+                onChange={e => updatePreFilter(f.id, 'operator', e.target.value)}
+                className="text-xs border-none outline-none bg-transparent text-emerald-700 font-mono cursor-pointer"
+              >
+                {['=', '!=', '>', '<', '>=', '<=', 'LIKE', 'NOT LIKE', 'IS NULL', 'IS NOT NULL'].map(op => (
+                  <option key={op} value={op}>{op}</option>
+                ))}
+              </select>
+              {!['IS NULL', 'IS NOT NULL'].includes(f.operator) && (
+                <input
+                  type="text"
+                  value={f.value}
+                  onChange={e => updatePreFilter(f.id, 'value', e.target.value)}
+                  placeholder="value…"
+                  className="text-xs border-none outline-none bg-transparent text-slate-700 w-20 placeholder:text-slate-300"
+                />
+              )}
+              <button onClick={() => removePreFilter(f.id)} className="text-slate-300 hover:text-red-500 transition-colors ml-0.5">
+                <X size={12} />
+              </button>
+            </div>
+          ))}
+          <button
+            onClick={addPreFilter}
+            className="flex items-center gap-1 text-xs text-emerald-600 hover:text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 px-2 py-1 rounded-lg transition-colors font-medium shrink-0"
+          >
+            <Plus size={12} /> Filter
+          </button>
+          <div className="ml-auto flex items-center gap-2 shrink-0">
+            <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">LIMIT</span>
+            <input
+              type="number"
+              min="1"
+              value={queryLimit}
+              onChange={e => setQueryLimit(e.target.value)}
+              placeholder="∞"
+              className="text-xs w-20 px-2 py-1 border border-slate-200 rounded-lg focus:ring-1 focus:ring-emerald-500 outline-none bg-white text-slate-700"
+            />
           </div>
         </div>
       </div>
@@ -903,11 +1042,12 @@ export function BuilderPane() {
                                 <span className="text-sm text-slate-700 truncate" title={col.name}>{col.name}</span>
                               </div>
                               <div className="opacity-0 group-hover:opacity-100 flex items-center gap-1 transition-opacity">
-                                <button onClick={() => addDimension(col.name)} className="text-[10px] font-medium bg-slate-200 hover:bg-slate-300 text-slate-700 px-1.5 py-0.5 rounded">Dim</button>
+                                <button onClick={() => addRowDimension(col.name)} className="text-[10px] font-medium bg-emerald-100 hover:bg-emerald-200 text-emerald-700 px-1.5 py-0.5 rounded">Row</button>
+                                <button onClick={() => addColDimension(col.name)} className="text-[10px] font-medium bg-purple-100 hover:bg-purple-200 text-purple-700 px-1.5 py-0.5 rounded">Col</button>
                                 {isNumeric && (
                                   <button onClick={() => addMeasure(col.name, 'sum')} className="text-[10px] font-medium bg-blue-100 hover:bg-blue-200 text-blue-700 px-1.5 py-0.5 rounded">Sum</button>
                                 )}
-                                <button onClick={() => addMeasure(col.name, 'count')} className="text-[10px] font-medium bg-emerald-100 hover:bg-emerald-200 text-emerald-700 px-1.5 py-0.5 rounded">Cnt</button>
+                                <button onClick={() => addMeasure(col.name, 'count')} className="text-[10px] font-medium bg-slate-200 hover:bg-slate-300 text-slate-700 px-1.5 py-0.5 rounded">Cnt</button>
                               </div>
                             </div>
                           );
