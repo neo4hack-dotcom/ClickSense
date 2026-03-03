@@ -1,10 +1,30 @@
 import os
 import json
 import requests as http_requests
+import urllib3
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, send_from_directory
+
+# Suppress InsecureRequestWarning for plain-HTTP endpoints that happen to
+# redirect through proxies that don't have trusted certs (e.g. local LLM
+# servers on http:// whose cert chain can't be verified).
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+def _http_get(url, **kwargs):
+    """GET with SSL verification disabled for plain-HTTP URLs."""
+    if url.startswith("http://"):
+        kwargs.setdefault("verify", False)
+    return http_requests.get(url, **kwargs)
+
+
+def _http_post(url, **kwargs):
+    """POST with SSL verification disabled for plain-HTTP URLs."""
+    if url.startswith("http://"):
+        kwargs.setdefault("verify", False)
+    return http_requests.post(url, **kwargs)
 
 load_dotenv()
 
@@ -200,7 +220,7 @@ def test_llm():
     provider = data.get("provider")
     try:
         if provider == "ollama":
-            resp = http_requests.get(
+            resp = _http_get(
                 f"{data['ollamaUrl']}/api/tags", timeout=10
             )
             if not resp.ok:
@@ -209,7 +229,7 @@ def test_llm():
             headers = {}
             if data.get("apiKey"):
                 headers["Authorization"] = f"Bearer {data['apiKey']}"
-            resp = http_requests.get(
+            resp = _http_get(
                 f"{data['httpUrl']}/v1/models", headers=headers, timeout=10
             )
             if not resp.ok:
@@ -223,7 +243,7 @@ def test_llm():
 def get_llm_models():
     try:
         if llm_config["provider"] == "ollama":
-            resp = http_requests.get(
+            resp = _http_get(
                 f"{llm_config['ollamaUrl']}/api/tags", timeout=10
             )
             if not resp.ok:
@@ -235,7 +255,7 @@ def get_llm_models():
             headers = {}
             if llm_config.get("apiKey"):
                 headers["Authorization"] = f"Bearer {llm_config['apiKey']}"
-            resp = http_requests.get(
+            resp = _http_get(
                 f"{llm_config['httpUrl']}/v1/models", headers=headers, timeout=10
             )
             if not resp.ok:
@@ -412,8 +432,6 @@ def execute_query():
             query,
             settings={
                 "max_execution_time": 15,
-                "max_rows_to_read": 1_000_000_000,
-                "max_bytes_to_read": 50_000_000_000,
                 "readonly": 1,
             },
         )
@@ -480,7 +498,7 @@ def chat():
             if llm_config.get("apiKey"):
                 headers["Authorization"] = f"Bearer {llm_config['apiKey']}"
 
-            resp = http_requests.post(
+            resp = _http_post(
                 f"{llm_config['httpUrl']}/v1/chat/completions",
                 json={
                     "model": llm_config["model"],
@@ -501,7 +519,7 @@ def chat():
             return jsonify(json.loads(content))
 
         elif llm_config["provider"] == "ollama":
-            resp = http_requests.post(
+            resp = _http_post(
                 f"{llm_config['ollamaUrl']}/api/chat",
                 json={
                     "model": llm_config.get("model", "llama3"),
