@@ -458,8 +458,9 @@ def _call_llm(system_prompt: str, messages: list, temperature: float = 0.7,
     base_url = (llm_config.get("baseUrl") or "").rstrip("/")
 
     if provider == "local_http":
-        # Full endpoint URL is stored directly in baseUrl
-        endpoint = base_url or "http://localhost:8000/v1/chat/completions"
+        endpoint = base_url or "http://localhost:8000"
+        if "/v1/chat" not in endpoint:
+            endpoint = endpoint.rstrip("/") + "/v1/chat/completions"
         headers = {"Content-Type": "application/json"}
         if llm_config.get("apiKey"):
             headers["Authorization"] = f"Bearer {llm_config['apiKey']}"
@@ -844,7 +845,9 @@ def test_llm():
             if not resp.ok:
                 raise Exception(f"Ollama error: {resp.status_code} - {resp.text}")
         elif provider == "local_http":
-            endpoint = base_url or "http://localhost:8000/v1/chat/completions"
+            endpoint = base_url or "http://localhost:8000"
+            if "/v1/chat" not in endpoint:
+                endpoint = endpoint.rstrip("/") + "/v1/chat/completions"
             headers = {"Content-Type": "application/json"}
             if data.get("apiKey"):
                 headers["Authorization"] = f"Bearer {data['apiKey']}"
