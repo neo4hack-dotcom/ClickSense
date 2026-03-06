@@ -299,6 +299,22 @@ def _strip_llm_markdown(text: str) -> str:
     return text.strip()
 
 
+def _parse_response_json(resp, label: str = "LLM") -> dict:
+    """Safely parse JSON from an HTTP response with descriptive errors."""
+    if not resp.text or not resp.text.strip():
+        raise Exception(
+            f"{label} returned an empty response body (HTTP {resp.status_code}). "
+            "Check that the server is running and the model is loaded."
+        )
+    try:
+        return resp.json()
+    except Exception as exc:
+        raise Exception(
+            f"{label} response is not valid JSON (HTTP {resp.status_code}): "
+            f"{resp.text[:300]!r}"
+        ) from exc
+
+
 def _parse_llm_json(content: str) -> dict:
     """Parse JSON from LLM output, handling markdown fences and extra surrounding text."""
     import re
@@ -346,7 +362,7 @@ def _call_llm(system_prompt: str, messages: list, temperature: float = 0.7) -> s
         )
         if not resp.ok:
             raise Exception(f"HTTP LLM Error: {resp.status_code} - {resp.text}")
-        resp_data = resp.json()
+        resp_data = _parse_response_json(resp, "HTTP LLM")
         content = (
             resp_data.get("choices", [{}])[0].get("message", {}).get("content")
             or resp_data.get("content")
@@ -367,7 +383,7 @@ def _call_llm(system_prompt: str, messages: list, temperature: float = 0.7) -> s
         )
         if not resp.ok:
             raise Exception(f"Ollama LLM Error: {resp.status_code} - {resp.text}")
-        resp_data = resp.json()
+        resp_data = _parse_response_json(resp, "Ollama LLM")
         content = resp_data.get("message", {}).get("content", "")
         return _strip_llm_markdown(content)
 
@@ -627,8 +643,8 @@ Instructions:
                 timeout=120,
             )
             if not resp.ok:
-                raise Exception(f"LLM Error: {resp.status_code}")
-            resp_data = resp.json()
+                raise Exception(f"LLM Error: {resp.status_code} - {resp.text}")
+            resp_data = _parse_response_json(resp, "HTTP LLM")
             answer = (
                 resp_data.get("choices", [{}])[0].get("message", {}).get("content")
                 or resp_data.get("content")
@@ -645,7 +661,9 @@ Instructions:
                 },
                 timeout=120,
             )
-            resp_data = resp.json()
+            if not resp.ok:
+                raise Exception(f"Ollama LLM Error: {resp.status_code} - {resp.text}")
+            resp_data = _parse_response_json(resp, "Ollama LLM")
             answer = resp_data.get("message", {}).get("content", "")
 
         else:
