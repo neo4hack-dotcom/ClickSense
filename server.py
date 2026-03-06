@@ -7,9 +7,7 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, send_from_directory
 
-# Suppress InsecureRequestWarning for plain-HTTP endpoints that happen to
-# redirect through proxies that don't have trusted certs (e.g. local LLM
-# servers on http:// whose cert chain can't be verified).
+# Suppress InsecureRequestWarning for plain-HTTP endpoints
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
@@ -26,6 +24,7 @@ def _http_post(url, **kwargs):
         kwargs.setdefault("verify", False)
     return http_requests.post(url, **kwargs)
 
+
 load_dotenv()
 
 PORT = int(os.environ.get("PORT", 3000))
@@ -36,7 +35,7 @@ app = Flask(__name__, static_folder=DIST_DIR, static_url_path="")
 
 
 # ---------------------------------------------------------------------------
-# CORS – allow the Vite dev server (different port) to call the API
+# CORS
 # ---------------------------------------------------------------------------
 @app.after_request
 def add_cors_headers(response):
@@ -59,7 +58,6 @@ DB_DIR = os.path.join(BASE_DIR, ".data")
 os.makedirs(DB_DIR, exist_ok=True)
 DB_FILE = os.path.join(DB_DIR, "app.json")
 
-# Migrate old app.json from root if it exists
 OLD_DB_FILE = os.path.join(BASE_DIR, "app.json")
 if os.path.exists(OLD_DB_FILE) and not os.path.exists(DB_FILE):
     os.rename(OLD_DB_FILE, DB_FILE)
@@ -69,6 +67,7 @@ DEFAULT_DB = {
     "saved_queries": [],
     "query_history": [],
     "table_metadata": [],
+    "knowledge_folders": [],
 }
 
 
@@ -95,7 +94,7 @@ if not os.path.exists(DB_FILE):
 
 
 # ---------------------------------------------------------------------------
-# In-memory configuration (persists for the lifetime of the process)
+# In-memory configuration
 # ---------------------------------------------------------------------------
 clickhouse_config = {
     "host": os.environ.get("CLICKHOUSE_HOST", "http://localhost:8123"),
@@ -114,12 +113,24 @@ llm_config = {
 
 knowledge_base = ""
 
+rag_config = {
+    "esHost": os.environ.get("ES_HOST", "http://localhost:9200"),
+    "esIndex": os.environ.get("ES_INDEX", "clicksense_rag"),
+    "esUsername": os.environ.get("ES_USER", ""),
+    "esPassword": os.environ.get("ES_PASSWORD", ""),
+    "embeddingProvider": "ollama",
+    "embeddingModel": "nomic-embed-text",
+    "embeddingUrl": "http://localhost:11434",
+    "embeddingApiKey": "",
+    "topK": 5,
+    "chunkSize": 500,
+}
+
 
 # ---------------------------------------------------------------------------
 # ClickHouse helper
 # ---------------------------------------------------------------------------
 def _parse_clickhouse_url(url: str) -> dict:
-    """Parse a URL like http://localhost:8123 into host/port/secure parts."""
     parsed = urlparse(url)
     return {
         "host": parsed.hostname or "localhost",
@@ -132,7 +143,7 @@ def get_clickhouse_client(cfg=None):
     if cfg is None:
         cfg = clickhouse_config
     try:
-        import clickhouse_connect  # noqa: PLC0415
+        import clickhouse_connect
     except ImportError as exc:
         raise RuntimeError(
             "clickhouse-connect is not installed. Run: pip install clickhouse-connect"
@@ -149,7 +160,6 @@ def get_clickhouse_client(cfg=None):
 
 
 def _rows_to_dicts(result) -> list:
-    """Convert a clickhouse_connect QueryResult to a list of JSON-serialisable dicts."""
     cols = result.column_names
     rows = []
     for row in result.result_rows:
@@ -164,17 +174,174 @@ def _rows_to_dicts(result) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Embedding helper
+# ---------------------------------------------------------------------------
+def _get_embedding(text: str, cfg: dict) -> list:
+    """Compute embedding for text using configured provider."""
+    provider = cfg.get("embeddingProvider", "ollama")
+    model = cfg.get("embeddingModel", "nomic-embed-text")
+
+    if provider == "ollama":
+        url = (cfg.get("embeddingUrl") or "http://localhost:11434").rstrip("/")
+        resp = _http_post(
+            f"{url}/api/embeddings",
+            json={"model": model, "prompt": text},
+            timeout=60,
+        )
+        if not resp.ok:
+            raise Exception(f"Ollama embedding error: {resp.status_code} {resp.text}")
+        return resp.json()["embedding"]
+
+    elif provider == "http":
+        url = (cfg.get("embeddingUrl") or "http://localhost:1234").rstrip("/")
+        headers = {"Content-Type": "application/json"}
+        if cfg.get("embeddingApiKey"):
+            headers["Authorization"] = f"Bearer {cfg['embeddingApiKey']}"
+        resp = _http_post(
+            f"{url}/v1/embeddings",
+            json={"model": model, "input": text},
+            headers=headers,
+            timeout=60,
+        )
+        if not resp.ok:
+            raise Exception(f"HTTP embedding error: {resp.status_code} {resp.text}")
+        data = resp.json()
+        return data["data"][0]["embedding"]
+
+    else:
+        raise Exception(f"Unknown embedding provider: {provider}")
+
+
+# ---------------------------------------------------------------------------
+# Elasticsearch helper
+# ---------------------------------------------------------------------------
+def _es_request(method: str, path: str, cfg: dict, **kwargs):
+    """Make a request to Elasticsearch."""
+    host = cfg.get("esHost", "http://localhost:9200").rstrip("/")
+    url = f"{host}{path}"
+    auth = None
+    if cfg.get("esUsername"):
+        auth = (cfg["esUsername"], cfg.get("esPassword", ""))
+    fn = _http_post if method.upper() == "POST" else _http_get
+    if method.upper() == "PUT":
+        fn = lambda u, **kw: http_requests.put(u, verify=False, **kw)
+    elif method.upper() == "DELETE":
+        fn = lambda u, **kw: http_requests.delete(u, verify=False, **kw)
+    elif method.upper() == "HEAD":
+        fn = lambda u, **kw: http_requests.head(u, verify=False, **kw)
+
+    return fn(url, auth=auth, **kwargs)
+
+
+def _chunk_text(text: str, chunk_size: int) -> list:
+    """Split text into chunks of roughly chunk_size chars, trying to split on newlines."""
+    chunks = []
+    while len(text) > chunk_size:
+        split_at = text.rfind("\n", 0, chunk_size)
+        if split_at == -1:
+            split_at = chunk_size
+        chunks.append(text[:split_at].strip())
+        text = text[split_at:].strip()
+    if text:
+        chunks.append(text)
+    return chunks
+
+
+def _ensure_es_index(cfg: dict, dims: int):
+    """Create ES index with dense_vector mapping if it doesn't exist."""
+    index = cfg.get("esIndex", "clicksense_rag")
+    host = cfg.get("esHost", "http://localhost:9200").rstrip("/")
+    auth = None
+    if cfg.get("esUsername"):
+        auth = (cfg["esUsername"], cfg.get("esPassword", ""))
+
+    check = http_requests.head(f"{host}/{index}", auth=auth, verify=False, timeout=10)
+    if check.status_code == 404:
+        mapping = {
+            "mappings": {
+                "properties": {
+                    "folder_id": {"type": "integer"},
+                    "title": {"type": "text"},
+                    "content": {"type": "text"},
+                    "chunk_index": {"type": "integer"},
+                    "embedding": {
+                        "type": "dense_vector",
+                        "dims": dims,
+                        "index": True,
+                        "similarity": "cosine",
+                    },
+                }
+            }
+        }
+        r = http_requests.put(
+            f"{host}/{index}",
+            auth=auth,
+            json=mapping,
+            verify=False,
+            timeout=10,
+        )
+        if not r.ok and r.status_code != 400:
+            raise Exception(f"Failed to create ES index: {r.text}")
+
+
+# ---------------------------------------------------------------------------
+# LLM call helper (shared)
+# ---------------------------------------------------------------------------
+def _call_llm(system_prompt: str, messages: list, temperature: float = 0.7) -> str:
+    """Call the configured LLM and return the content string."""
+    if llm_config["provider"] == "http":
+        headers = {"Content-Type": "application/json"}
+        if llm_config.get("apiKey"):
+            headers["Authorization"] = f"Bearer {llm_config['apiKey']}"
+        base_url = (llm_config.get("httpUrl") or "http://localhost:8000").rstrip("/")
+        resp = _http_post(
+            f"{base_url}/v1/chat/completions",
+            json={
+                "model": llm_config.get("model") or "local-model",
+                "messages": [{"role": "system", "content": system_prompt}] + messages,
+                "temperature": temperature,
+            },
+            headers=headers,
+            timeout=120,
+        )
+        if not resp.ok:
+            raise Exception(f"HTTP LLM Error: {resp.status_code} - {resp.text}")
+        resp_data = resp.json()
+        content = (
+            resp_data.get("choices", [{}])[0].get("message", {}).get("content")
+            or resp_data.get("content")
+            or ""
+        )
+        return content.replace("```json", "").replace("```JSON", "").replace("```", "").strip()
+
+    elif llm_config["provider"] == "ollama":
+        resp = _http_post(
+            f"{llm_config['ollamaUrl']}/api/chat",
+            json={
+                "model": llm_config.get("model", "llama3"),
+                "messages": [{"role": "system", "content": system_prompt}] + messages,
+                "stream": False,
+                "format": "json",
+            },
+            timeout=120,
+        )
+        resp_data = resp.json()
+        return resp_data["message"]["content"]
+
+    else:
+        raise Exception("Invalid LLM provider")
+
+
+# ---------------------------------------------------------------------------
 # Configuration endpoints
 # ---------------------------------------------------------------------------
 @app.route("/api/config", methods=["GET"])
 def get_config():
-    return jsonify(
-        {
-            "clickhouseConfig": clickhouse_config,
-            "llmConfig": llm_config,
-            "knowledgeBase": knowledge_base,
-        }
-    )
+    return jsonify({
+        "clickhouseConfig": clickhouse_config,
+        "llmConfig": llm_config,
+        "knowledgeBase": knowledge_base,
+    })
 
 
 @app.route("/api/config", methods=["POST"])
@@ -191,20 +358,276 @@ def update_config():
 
 
 # ---------------------------------------------------------------------------
+# RAG configuration endpoints
+# ---------------------------------------------------------------------------
+@app.route("/api/rag/config", methods=["GET"])
+def get_rag_config():
+    return jsonify(rag_config)
+
+
+@app.route("/api/rag/config", methods=["POST"])
+def update_rag_config():
+    global rag_config
+    data = request.get_json()
+    rag_config.update(data)
+    return jsonify({"success": True})
+
+
+@app.route("/api/rag/test", methods=["POST"])
+def test_elasticsearch():
+    data = request.get_json()
+    try:
+        host = data.get("esHost", "http://localhost:9200").rstrip("/")
+        auth = None
+        if data.get("esUsername"):
+            auth = (data["esUsername"], data.get("esPassword", ""))
+        resp = http_requests.get(f"{host}/_cluster/health", auth=auth, verify=False, timeout=10)
+        if not resp.ok:
+            raise Exception(f"ES returned {resp.status_code}: {resp.text}")
+        return jsonify({"success": True, "status": resp.json().get("status")})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/rag/embedding-models", methods=["POST"])
+def get_embedding_models():
+    data = request.get_json()
+    provider = data.get("embeddingProvider", "ollama")
+    try:
+        if provider == "ollama":
+            url = (data.get("embeddingUrl") or "http://localhost:11434").rstrip("/")
+            resp = _http_get(f"{url}/api/tags", timeout=10)
+            if not resp.ok:
+                raise Exception(f"Ollama error: {resp.status_code}")
+            models = [m["name"] for m in resp.json().get("models", [])]
+            return jsonify({"models": models})
+        elif provider == "http":
+            url = (data.get("embeddingUrl") or "http://localhost:1234").rstrip("/")
+            headers = {}
+            if data.get("embeddingApiKey"):
+                headers["Authorization"] = f"Bearer {data['embeddingApiKey']}"
+            resp = _http_get(f"{url}/v1/models", headers=headers, timeout=10)
+            if not resp.ok:
+                return jsonify({"models": []})
+            models = [m.get("id") or m.get("name", "") for m in resp.json().get("data", [])]
+            return jsonify({"models": [m for m in models if m]})
+        return jsonify({"models": []})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/rag/index", methods=["POST"])
+def index_knowledge_to_es():
+    """Embed all knowledge folders and index them in Elasticsearch."""
+    data = request.get_json()
+    cfg = data.get("ragConfig", rag_config)
+    db = read_db()
+    folders = db.get("knowledge_folders", [])
+
+    if not folders:
+        return jsonify({"error": "No knowledge folders to index"}), 400
+
+    try:
+        # Determine embedding dimension by running one test embedding
+        test_vec = _get_embedding("test", cfg)
+        dims = len(test_vec)
+        _ensure_es_index(cfg, dims)
+
+        host = cfg.get("esHost", "http://localhost:9200").rstrip("/")
+        index = cfg.get("esIndex", "clicksense_rag")
+        chunk_size = int(cfg.get("chunkSize", 500))
+        auth = None
+        if cfg.get("esUsername"):
+            auth = (cfg["esUsername"], cfg.get("esPassword", ""))
+
+        # Delete existing documents for a fresh index
+        http_requests.post(
+            f"{host}/{index}/_delete_by_query",
+            auth=auth,
+            json={"query": {"match_all": {}}},
+            verify=False,
+            timeout=30,
+        )
+
+        total_chunks = 0
+        for folder in folders:
+            content = folder.get("content", "")
+            title = folder.get("title", "")
+            folder_id = folder.get("id")
+            if not content.strip():
+                continue
+
+            chunks = _chunk_text(content, chunk_size)
+            for chunk_idx, chunk in enumerate(chunks):
+                embedding = _get_embedding(f"{title}\n\n{chunk}", cfg)
+                doc = {
+                    "folder_id": folder_id,
+                    "title": title,
+                    "content": chunk,
+                    "chunk_index": chunk_idx,
+                    "embedding": embedding,
+                }
+                http_requests.post(
+                    f"{host}/{index}/_doc",
+                    auth=auth,
+                    json=doc,
+                    verify=False,
+                    timeout=30,
+                )
+                total_chunks += 1
+
+        # Refresh index
+        http_requests.post(f"{host}/{index}/_refresh", auth=auth, verify=False, timeout=10)
+
+        return jsonify({"success": True, "indexed": total_chunks, "folders": len(folders)})
+
+    except Exception as exc:
+        print(f"Index error: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/rag/chat", methods=["POST"])
+def rag_chat():
+    """RAG chat: embed query → ES kNN search → LLM augmented generation."""
+    data = request.get_json()
+    query = data.get("query", "")
+    history = data.get("history", [])
+    cfg = data.get("ragConfig", rag_config)
+    top_k = int(cfg.get("topK", 5))
+
+    if not query:
+        return jsonify({"error": "Empty query"}), 400
+
+    try:
+        # 1. Embed the user query
+        query_embedding = _get_embedding(query, cfg)
+
+        # 2. kNN search in Elasticsearch
+        host = cfg.get("esHost", "http://localhost:9200").rstrip("/")
+        index = cfg.get("esIndex", "clicksense_rag")
+        auth = None
+        if cfg.get("esUsername"):
+            auth = (cfg["esUsername"], cfg.get("esPassword", ""))
+
+        knn_query = {
+            "knn": {
+                "field": "embedding",
+                "query_vector": query_embedding,
+                "k": top_k,
+                "num_candidates": top_k * 10,
+            },
+            "_source": ["title", "content", "folder_id", "chunk_index"],
+        }
+
+        es_resp = http_requests.post(
+            f"{host}/{index}/_search",
+            auth=auth,
+            json=knn_query,
+            verify=False,
+            timeout=30,
+        )
+
+        sources = []
+        context_parts = []
+
+        if es_resp.ok:
+            hits = es_resp.json().get("hits", {}).get("hits", [])
+            for hit in hits:
+                src = hit.get("_source", {})
+                score = hit.get("_score", 0)
+                # Normalize cosine score (ES returns 0-1 for cosine similarity mapping)
+                sources.append({
+                    "title": src.get("title", ""),
+                    "score": round(float(score), 4),
+                    "excerpt": src.get("content", "")[:300],
+                    "folder_id": src.get("folder_id"),
+                })
+                context_parts.append(
+                    f"[Source: {src.get('title', 'Unknown')}]\n{src.get('content', '')}"
+                )
+
+        # 3. Build augmented prompt
+        context_text = "\n\n---\n\n".join(context_parts) if context_parts else "No relevant knowledge found."
+
+        system_prompt = f"""You are a knowledgeable assistant with access to a specialized knowledge base.
+Use the following retrieved context to answer the user's question accurately and concisely.
+If the context doesn't contain enough information, say so clearly rather than guessing.
+
+RETRIEVED CONTEXT:
+{context_text}
+
+Instructions:
+- Base your answer primarily on the retrieved context
+- Be specific and cite which source you are referencing when relevant
+- If multiple sources provide complementary information, synthesize them
+- If the context is insufficient, indicate what information is missing
+"""
+
+        # 4. Call LLM
+        formatted_messages = [{"role": m["role"], "content": m["content"]} for m in history]
+        formatted_messages.append({"role": "user", "content": query})
+
+        # For RAG we return plain text, not JSON
+        if llm_config["provider"] == "http":
+            headers = {"Content-Type": "application/json"}
+            if llm_config.get("apiKey"):
+                headers["Authorization"] = f"Bearer {llm_config['apiKey']}"
+            base_url = (llm_config.get("httpUrl") or "http://localhost:8000").rstrip("/")
+            resp = _http_post(
+                f"{base_url}/v1/chat/completions",
+                json={
+                    "model": llm_config.get("model") or "local-model",
+                    "messages": [{"role": "system", "content": system_prompt}] + formatted_messages,
+                    "temperature": 0.3,
+                },
+                headers=headers,
+                timeout=120,
+            )
+            if not resp.ok:
+                raise Exception(f"LLM Error: {resp.status_code}")
+            resp_data = resp.json()
+            answer = (
+                resp_data.get("choices", [{}])[0].get("message", {}).get("content")
+                or resp_data.get("content")
+                or ""
+            )
+
+        elif llm_config["provider"] == "ollama":
+            resp = _http_post(
+                f"{llm_config['ollamaUrl']}/api/chat",
+                json={
+                    "model": llm_config.get("model", "llama3"),
+                    "messages": [{"role": "system", "content": system_prompt}] + formatted_messages,
+                    "stream": False,
+                },
+                timeout=120,
+            )
+            resp_data = resp.json()
+            answer = resp_data.get("message", {}).get("content", "")
+
+        else:
+            raise Exception("Invalid LLM provider")
+
+        return jsonify({"answer": answer, "sources": sources})
+
+    except Exception as exc:
+        print(f"RAG chat error: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+
+# ---------------------------------------------------------------------------
 # ClickHouse connection test
 # ---------------------------------------------------------------------------
 @app.route("/api/clickhouse/test", methods=["POST"])
 def test_clickhouse():
     data = request.get_json()
     try:
-        client = get_clickhouse_client(
-            {
-                "host": data["host"],
-                "username": data["username"],
-                "password": data["password"],
-                "database": data["database"],
-            }
-        )
+        client = get_clickhouse_client({
+            "host": data["host"],
+            "username": data["username"],
+            "password": data["password"],
+            "database": data["database"],
+        })
         client.query("SELECT 1")
         return jsonify({"success": True})
     except Exception as exc:
@@ -221,9 +644,7 @@ def test_llm():
     try:
         if provider == "ollama":
             ollama_url = data.get("ollamaUrl") or "http://localhost:11434"
-            resp = _http_get(
-                f"{ollama_url}/api/tags", timeout=10
-            )
+            resp = _http_get(f"{ollama_url}/api/tags", timeout=10)
             if not resp.ok:
                 raise Exception(f"Ollama error: {resp.status_code}")
         elif provider == "http":
@@ -231,10 +652,7 @@ def test_llm():
             if data.get("apiKey"):
                 headers["Authorization"] = f"Bearer {data['apiKey']}"
             base_url = (data.get("httpUrl") or "http://localhost:8000").rstrip("/")
-            resp = _http_get(
-                f"{base_url}/v1/models", headers=headers, timeout=10
-            )
-            # 404 is acceptable — server is reachable but may not expose /v1/models
+            resp = _http_get(f"{base_url}/v1/models", headers=headers, timeout=10)
             if not resp.ok and resp.status_code != 404:
                 raise Exception(f"HTTP LLM server returned {resp.status_code}")
         return jsonify({"success": True})
@@ -246,31 +664,24 @@ def test_llm():
 def get_llm_models():
     try:
         if llm_config["provider"] == "ollama":
-            resp = _http_get(
-                f"{llm_config['ollamaUrl']}/api/tags", timeout=10
-            )
+            resp = _http_get(f"{llm_config['ollamaUrl']}/api/tags", timeout=10)
             if not resp.ok:
                 raise Exception(f"Ollama error: {resp.status_code}")
-            data = resp.json()
-            models = [m["name"] for m in data.get("models", [])]
+            models = [m["name"] for m in resp.json().get("models", [])]
             return jsonify({"models": models})
         elif llm_config["provider"] == "http":
             headers = {}
             if llm_config.get("apiKey"):
                 headers["Authorization"] = f"Bearer {llm_config['apiKey']}"
             base_url = (llm_config.get("httpUrl") or "http://localhost:8000").rstrip("/")
-            resp = _http_get(
-                f"{base_url}/v1/models", headers=headers, timeout=10
-            )
+            resp = _http_get(f"{base_url}/v1/models", headers=headers, timeout=10)
             if not resp.ok:
                 if resp.status_code == 404:
                     return jsonify({"models": []})
                 raise Exception(f"HTTP error: {resp.status_code}")
-            data = resp.json()
-            models = [m.get("id") or m.get("name", "") for m in data.get("data", []) if m.get("id") or m.get("name")]
+            models = [m.get("id") or m.get("name", "") for m in resp.json().get("data", []) if m.get("id") or m.get("name")]
             return jsonify({"models": models})
-        else:
-            return jsonify({"models": []})
+        return jsonify({"models": []})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
@@ -282,7 +693,6 @@ def get_llm_models():
 def get_schema():
     try:
         client = get_clickhouse_client()
-        # Use currentDatabase() to avoid SQL-injection from the config value
         result = client.query(
             "SELECT table, name, type FROM system.columns"
             " WHERE database = currentDatabase()"
@@ -332,21 +742,75 @@ def update_table_metadata():
     is_favorite = 1 if data.get("is_favorite") else 0
 
     db = read_db()
-    idx = next(
-        (i for i, m in enumerate(db["table_metadata"]) if m["table_name"] == table_name),
-        None,
-    )
+    idx = next((i for i, m in enumerate(db["table_metadata"]) if m["table_name"] == table_name), None)
     if idx is not None:
         db["table_metadata"][idx]["description"] = description
         db["table_metadata"][idx]["is_favorite"] = is_favorite
     else:
-        db["table_metadata"].append(
-            {
-                "table_name": table_name,
-                "description": description,
-                "is_favorite": is_favorite,
-            }
-        )
+        db["table_metadata"].append({
+            "table_name": table_name,
+            "description": description,
+            "is_favorite": is_favorite,
+        })
+    write_db(db)
+    return jsonify({"success": True})
+
+
+# ---------------------------------------------------------------------------
+# Knowledge Base Folders
+# ---------------------------------------------------------------------------
+@app.route("/api/knowledge/folders", methods=["GET"])
+def get_knowledge_folders():
+    db = read_db()
+    folders = db.get("knowledge_folders", [])
+    return jsonify(folders)
+
+
+@app.route("/api/knowledge/folders", methods=["POST"])
+def create_knowledge_folder():
+    data = request.get_json()
+    db = read_db()
+    if "knowledge_folders" not in db:
+        db["knowledge_folders"] = []
+
+    new_id = max((f["id"] for f in db["knowledge_folders"]), default=0) + 1
+    now = datetime.now(timezone.utc).isoformat()
+    folder = {
+        "id": new_id,
+        "title": data.get("title", ""),
+        "content": data.get("content", ""),
+        "created_at": now,
+        "updated_at": now,
+    }
+    db["knowledge_folders"].append(folder)
+    write_db(db)
+    return jsonify(folder)
+
+
+@app.route("/api/knowledge/folders/<int:folder_id>", methods=["PUT"])
+def update_knowledge_folder(folder_id):
+    data = request.get_json()
+    db = read_db()
+    folders = db.get("knowledge_folders", [])
+    idx = next((i for i, f in enumerate(folders) if f["id"] == folder_id), None)
+    if idx is None:
+        return jsonify({"error": "Folder not found"}), 404
+
+    now = datetime.now(timezone.utc).isoformat()
+    if "title" in data:
+        folders[idx]["title"] = data["title"]
+    if "content" in data:
+        folders[idx]["content"] = data["content"]
+    folders[idx]["updated_at"] = now
+
+    write_db(db)
+    return jsonify(folders[idx])
+
+
+@app.route("/api/knowledge/folders/<int:folder_id>", methods=["DELETE"])
+def delete_knowledge_folder(folder_id):
+    db = read_db()
+    db["knowledge_folders"] = [f for f in db.get("knowledge_folders", []) if f["id"] != folder_id]
     write_db(db)
     return jsonify({"success": True})
 
@@ -359,15 +823,13 @@ def add_history():
     data = request.get_json()
     db = read_db()
     new_id = max((h["id"] for h in db["query_history"]), default=0) + 1
-    db["query_history"].append(
-        {
-            "id": new_id,
-            "user_id": data["user_id"],
-            "query_text": data["query_text"],
-            "sql": data["sql"],
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-    )
+    db["query_history"].append({
+        "id": new_id,
+        "user_id": data["user_id"],
+        "query_text": data["query_text"],
+        "sql": data["sql"],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
     write_db(db)
     return jsonify({"success": True})
 
@@ -388,16 +850,14 @@ def add_saved_query():
     data = request.get_json()
     db = read_db()
     new_id = max((q["id"] for q in db["saved_queries"]), default=0) + 1
-    db["saved_queries"].append(
-        {
-            "id": new_id,
-            "user_id": data["user_id"],
-            "name": data["name"],
-            "sql": data["sql"],
-            "config": json.dumps(data.get("config", {})),
-            "visual_type": data.get("visual_type", "table"),
-        }
-    )
+    db["saved_queries"].append({
+        "id": new_id,
+        "user_id": data["user_id"],
+        "name": data["name"],
+        "sql": data["sql"],
+        "config": json.dumps(data.get("config", {})),
+        "visual_type": data.get("visual_type", "table"),
+    })
     write_db(db)
     return jsonify({"success": True})
 
@@ -426,7 +886,7 @@ def delete_saved_query(query_id):
 
 
 # ---------------------------------------------------------------------------
-# Query execution (with guardrails)
+# Query execution
 # ---------------------------------------------------------------------------
 @app.route("/api/query", methods=["POST"])
 def execute_query():
@@ -434,13 +894,7 @@ def execute_query():
     query = data["query"]
     try:
         client = get_clickhouse_client()
-        result = client.query(
-            query,
-            settings={
-                "max_execution_time": 15,
-                "readonly": 1,
-            },
-        )
+        result = client.query(query, settings={"max_execution_time": 15, "readonly": 1})
         rows = _rows_to_dicts(result)
         return jsonify({"data": rows})
     except Exception as exc:
@@ -448,7 +902,7 @@ def execute_query():
 
 
 # ---------------------------------------------------------------------------
-# AI chat (SQL generation)
+# AI chat (SQL generation) with ambiguity detection
 # ---------------------------------------------------------------------------
 @app.route("/api/chat", methods=["POST"])
 def chat():
@@ -457,99 +911,66 @@ def chat():
     schema = data.get("schema", {})
     table_metadata = data.get("tableMetadata", {})
 
-    system_prompt = f"""
-      You are an expert ClickHouse data analyst.
-      Your goal is to help the user query their database.
+    # Build knowledge context from folders
+    db = read_db()
+    folders = db.get("knowledge_folders", [])
+    knowledge_context = "\n\n".join(
+        f"[{f['title']}]\n{f['content']}" for f in folders if f.get("content")
+    ) or knowledge_base
 
-      Here is the database schema:
-      {json.dumps(schema, indent=2)}
+    system_prompt = f"""You are an expert ClickHouse data analyst.
+Your goal is to help the user query their database.
 
-      Here is the table metadata (functional descriptions):
-      {json.dumps(table_metadata, indent=2)}
+Here is the database schema:
+{json.dumps(schema, indent=2)}
 
-      Here is the functional knowledge base to help you understand the business context:
-      {knowledge_base}
+Here is the table metadata (functional descriptions):
+{json.dumps(table_metadata, indent=2)}
 
-      CRITICAL INSTRUCTIONS FOR CLICKHOUSE:
-      - Use advanced ClickHouse functions when appropriate to answer business questions efficiently.
-      - For funnels, use windowFunnel().
-      - For retention, use retention().
-      - For pattern matching, use sequenceMatch().
-      - For cross-selling or arrays, use arrayJoin().
-      - For latest status, use argMax().
-      - For fast top trends, use topK().
-      - For unique visitors on large datasets, prefer uniqHLL12() over count(distinct).
-      - For response times, use quantilesTiming().
-      - For JSON parsing, use JSONExtract().
-      - For conditional pivots, use sumIf(), countIf(), etc.
-      - For A/B testing, use studentTTest() or welchTTest().
-      - For geospatial, use geoDistance().
-      - Always write highly optimized SQL.
+Here is the functional knowledge base:
+{knowledge_context}
 
-      When the user asks a question, you should provide a valid ClickHouse SQL query to answer it.
-      Return ONLY a JSON object with the following structure:
-      {{
-        "sql": "SELECT ...",
-        "explanation": "A brief explanation of what the query does and which advanced ClickHouse function was used.",
-        "suggestedVisual": "table" | "bar" | "line" | "pie"
-      }}
-      Do not include markdown formatting like ```json. Just the raw JSON object.
-    """
+AMBIGUITY HANDLING — CRITICAL:
+Before generating SQL, check if the user request is ambiguous:
+
+1. TABLE AMBIGUITY: If the user mentions a concept (e.g., "orders") but there are multiple tables that could match,
+   return a clarification request instead of generating SQL.
+
+2. FIELD AMBIGUITY: If the user asks to display or use a field type (e.g., "date", "id", "name")
+   and there are MULTIPLE fields of that type in the same table, return a clarification.
+
+When ambiguous, return ONLY this JSON:
+{{
+  "needs_clarification": true,
+  "question": "Clear question in the user's language asking them to choose",
+  "options": ["option1", "option2", "option3"],
+  "type": "field_selection" | "table_selection"
+}}
+
+CLICKHOUSE INSTRUCTIONS:
+- Use advanced ClickHouse functions when appropriate.
+- For funnels: windowFunnel(). For retention: retention(). For patterns: sequenceMatch().
+- For latest status: argMax(). For top-K: topK(). For unique counts: uniqHLL12().
+- For response times: quantilesTiming(). For JSON: JSONExtract(). For conditionals: sumIf(), countIf().
+- Always write highly optimized SQL.
+
+When NOT ambiguous, return ONLY this JSON:
+{{
+  "sql": "SELECT ...",
+  "explanation": "Brief explanation of what the query does.",
+  "suggestedVisual": "table" | "bar" | "line" | "pie"
+}}
+
+Do not include markdown formatting. Just the raw JSON.
+"""
 
     formatted_messages = [{"role": m["role"], "content": m["content"]} for m in messages]
 
     try:
-        if llm_config["provider"] == "http":
-            headers = {"Content-Type": "application/json"}
-            if llm_config.get("apiKey"):
-                headers["Authorization"] = f"Bearer {llm_config['apiKey']}"
-
-            base_url = (llm_config.get("httpUrl") or "http://localhost:8000").rstrip("/")
-            resp = _http_post(
-                f"{base_url}/v1/chat/completions",
-                json={
-                    "model": llm_config.get("model") or "local-model",
-                    "messages": [{"role": "system", "content": system_prompt}]
-                    + formatted_messages,
-                    "temperature": 0.7,
-                },
-                headers=headers,
-                timeout=120,
-            )
-
-            if not resp.ok:
-                raise Exception(f"HTTP LLM Error: {resp.status_code} - {resp.text}")
-
-            resp_data = resp.json()
-            # Flexible content extraction — compatible with LocalAI, LM Studio, Ollama /v1, etc.
-            content = (
-                resp_data.get("choices", [{}])[0].get("message", {}).get("content")
-                or resp_data.get("content")
-                or ""
-            )
-            content = content.replace("```json", "").replace("```JSON", "").replace("```", "").strip()
-            if not content:
-                raise Exception("Le LLM a renvoyé une réponse vide. Vérifiez que le modèle supporte la sortie JSON.")
-            return jsonify(json.loads(content))
-
-        elif llm_config["provider"] == "ollama":
-            resp = _http_post(
-                f"{llm_config['ollamaUrl']}/api/chat",
-                json={
-                    "model": llm_config.get("model", "llama3"),
-                    "messages": [{"role": "system", "content": system_prompt}]
-                    + formatted_messages,
-                    "stream": False,
-                    "format": "json",
-                },
-                timeout=120,
-            )
-
-            resp_data = resp.json()
-            return jsonify(json.loads(resp_data["message"]["content"]))
-
-        else:
-            return jsonify({"error": "Invalid LLM provider"}), 400
+        content = _call_llm(system_prompt, formatted_messages, temperature=0.3)
+        if not content:
+            raise Exception("LLM returned empty response.")
+        return jsonify(json.loads(content))
 
     except Exception as exc:
         print(f"Chat error: {exc}")
@@ -565,23 +986,22 @@ def analyze_query():
     sql = data.get("sql", "")
     schema = data.get("schema", {})
 
-    system_prompt = f"""
-You are an expert ClickHouse SQL performance analyst and data engineer.
+    system_prompt = f"""You are an expert ClickHouse SQL performance analyst.
 Analyze the following SQL query and provide:
-1. Performance alerts (full table scans, missing LIMIT, unoptimized aggregations, etc.)
-2. Correctness concerns (potential wrong results, type mismatches, NULL handling)
+1. Performance alerts (full table scans, missing LIMIT, unoptimized aggregations)
+2. Correctness concerns (wrong results, type mismatches, NULL handling)
 3. Optimization suggestions (better functions, indexes, partitioning hints)
 4. Data projections (estimated result size, cardinality warnings)
 
 Database schema context:
 {json.dumps(schema, indent=2)}
 
-Return ONLY a JSON object (no markdown, no code blocks) with this exact structure:
+Return ONLY a JSON object (no markdown) with:
 {{
-  "alerts": ["alert message 1", "alert message 2"],
-  "suggestions": ["suggestion 1", "suggestion 2"],
-  "projections": ["projection/estimate 1"],
-  "optimized_sql": "improved SQL or empty string if already optimal",
+  "alerts": ["alert message 1"],
+  "suggestions": ["suggestion 1"],
+  "projections": ["projection 1"],
+  "optimized_sql": "improved SQL or empty string",
   "risk_level": "low" | "medium" | "high"
 }}
 """
@@ -589,67 +1009,19 @@ Return ONLY a JSON object (no markdown, no code blocks) with this exact structur
     user_message = f"Analyze this ClickHouse SQL query:\n\n{sql}"
 
     try:
-        if llm_config["provider"] == "http":
-            headers = {"Content-Type": "application/json"}
-            if llm_config.get("apiKey"):
-                headers["Authorization"] = f"Bearer {llm_config['apiKey']}"
-            base_url = (llm_config.get("httpUrl") or "http://localhost:8000").rstrip("/")
-            resp = _http_post(
-                f"{base_url}/v1/chat/completions",
-                json={
-                    "model": llm_config.get("model") or "local-model",
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_message},
-                    ],
-                    "temperature": 0.3,
-                },
-                headers=headers,
-                timeout=60,
-            )
-            if not resp.ok:
-                raise Exception(f"HTTP LLM Error: {resp.status_code} - {resp.text}")
-            resp_data = resp.json()
-            content = (
-                resp_data.get("choices", [{}])[0].get("message", {}).get("content")
-                or resp_data.get("content")
-                or ""
-            )
-            content = content.replace("```json", "").replace("```JSON", "").replace("```", "").strip()
-            return jsonify(json.loads(content))
-
-        elif llm_config["provider"] == "ollama":
-            resp = _http_post(
-                f"{llm_config['ollamaUrl']}/api/chat",
-                json={
-                    "model": llm_config.get("model", "llama3"),
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_message},
-                    ],
-                    "stream": False,
-                    "format": "json",
-                },
-                timeout=60,
-            )
-            resp_data = resp.json()
-            return jsonify(json.loads(resp_data["message"]["content"]))
-
-        else:
-            return jsonify({"error": "Invalid LLM provider"}), 400
-
+        content = _call_llm(system_prompt, [{"role": "user", "content": user_message}], temperature=0.3)
+        return jsonify(json.loads(content))
     except Exception as exc:
         print(f"Analyze error: {exc}")
         return jsonify({"error": str(exc)}), 500
 
 
 # ---------------------------------------------------------------------------
-# Serve built frontend (production)
+# Serve built frontend
 # ---------------------------------------------------------------------------
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")
 def serve_frontend(path):
-    # Never intercept API routes (safety guard)
     if path.startswith("api/"):
         return jsonify({"error": "Not found"}), 404
     if os.path.exists(DIST_DIR):
@@ -658,8 +1030,7 @@ def serve_frontend(path):
             return send_from_directory(DIST_DIR, path)
         return send_from_directory(DIST_DIR, "index.html")
     return (
-        "<h2>Frontend not built.</h2><p>Run <code>npm run build</code> first,"
-        " or start the Vite dev server with <code>npm run dev</code>.</p>",
+        "<h2>Frontend not built.</h2><p>Run <code>npm run build</code> first.</p>",
         404,
     )
 

@@ -1,22 +1,22 @@
 import { useState, useRef, useEffect } from 'react';
-import { Send, Bot, User, Loader2, Sparkles, Play, Save, History, Trash2 } from 'lucide-react';
+import {
+  Send, Bot, Loader2, Sparkles, Play, Save, History, Trash2,
+  Maximize2, Minimize2, Minus, CheckSquare
+} from 'lucide-react';
 import { useAppStore } from '../store';
 import clsx from 'clsx';
 import { motion } from 'motion/react';
 
 export function ChatPane() {
-  const { chatHistory, addChatMessage, clearChatHistory, schema, setQueryResult, currentUser, queryHistory, setQueryHistory, tableMetadata } = useAppStore();
+  const {
+    chatHistory, addChatMessage, clearChatHistory,
+    schema, setQueryResult, queryHistory, setQueryHistory,
+    tableMetadata, chatPaneSize, setChatPaneSize
+  } = useAppStore();
+
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (currentUser) {
-      fetch(`/api/history/${currentUser.id}`)
-        .then(res => res.json())
-        .then(data => setQueryHistory(data));
-    }
-  }, [currentUser]);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -26,18 +26,18 @@ export function ChatPane() {
     scrollToBottom();
   }, [chatHistory]);
 
-  const handleSend = async () => {
-    if (!input.trim()) return;
-    
-    const userMsg = input;
+  const handleSend = async (overrideInput?: string) => {
+    const text = overrideInput ?? input;
+    if (!text.trim()) return;
+
     setInput('');
-    addChatMessage({ role: 'user', content: userMsg });
+    addChatMessage({ role: 'user', content: text });
     setIsLoading(true);
 
     try {
       const messagesToSend = [
         ...chatHistory,
-        { role: 'user', content: userMsg }
+        { role: 'user', content: text }
       ];
 
       const res = await fetch('/api/chat', {
@@ -45,14 +45,23 @@ export function ChatPane() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messages: messagesToSend, schema, tableMetadata }),
       });
-      
+
       const data = await res.json();
-      
+
       if (data.error) {
         addChatMessage({ role: 'assistant', content: `Error: ${data.error}` });
+      } else if (data.needs_clarification) {
+        addChatMessage({
+          role: 'assistant',
+          content: data.question || 'Could you be more specific?',
+          needs_clarification: true,
+          question: data.question,
+          options: data.options || [],
+          clarification_type: data.type || 'field_selection',
+        });
       } else {
-        addChatMessage({ 
-          role: 'assistant', 
+        addChatMessage({
+          role: 'assistant',
           content: data.explanation || 'Here is the query I generated:',
           sql: data.sql,
           visual: data.suggestedVisual
@@ -77,19 +86,6 @@ export function ChatPane() {
         alert(`Query Error: ${data.error}`);
       } else {
         setQueryResult(data.data);
-        
-        // Save to history
-        if (currentUser) {
-          fetch('/api/history', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ user_id: currentUser.id, query_text: queryText, sql }),
-          }).then(() => {
-            fetch(`/api/history/${currentUser.id}`)
-              .then(r => r.json())
-              .then(d => setQueryHistory(d));
-          });
-        }
       }
     } catch (error: any) {
       alert(`Execution Error: ${error.message}`);
@@ -97,17 +93,15 @@ export function ChatPane() {
   };
 
   const handleSaveToDashboard = async (sql: string, visual: string, name: string) => {
-    if (!currentUser) return alert("Please select a user first");
-    
     try {
       await fetch('/api/saved_queries', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          user_id: currentUser.id,
+          user_id: 1,
           name: name || "Saved from Chat",
           sql,
-          config: { dimensions: [], measures: [] }, // Chat queries might not have builder config
+          config: { dimensions: [], measures: [] },
           visual_type: visual || 'table'
         }),
       });
@@ -124,56 +118,78 @@ export function ChatPane() {
     "Search for the value '[value]' in the table [table_name]"
   ];
 
-  const suggestions = queryHistory.length > 0 
-    ? Array.from(new Set(queryHistory.map(h => h.query_text))).filter(q => q !== 'Built via Visual Builder').slice(0, 3)
+  const suggestions = queryHistory.length > 0
+    ? Array.from(new Set(queryHistory.map((h: any) => h.query_text))).filter(q => q !== 'Built via Visual Builder').slice(0, 3)
     : defaultSuggestions;
-  
+
   if (suggestions.length === 0) suggestions.push(...defaultSuggestions);
+
+  const toggleSize = () => {
+    if (chatPaneSize === 'normal') setChatPaneSize('expanded');
+    else setChatPaneSize('normal');
+  };
 
   return (
     <div className="flex flex-col h-full bg-slate-50 border-r border-slate-200">
-      <div className="p-6 border-b border-slate-200 bg-white flex items-center justify-between">
+      {/* Header */}
+      <div className="p-4 border-b border-slate-200 bg-white flex items-center justify-between shrink-0">
         <div className="flex items-center gap-3">
           <div className="bg-emerald-100 p-2 rounded-full text-emerald-600">
-            <Sparkles size={20} />
+            <Sparkles size={18} />
           </div>
           <div>
-            <h2 className="text-lg font-semibold text-slate-800">AI Data Analyst</h2>
-            <p className="text-sm text-slate-500">Ask questions in plain English</p>
+            <h2 className="text-base font-semibold text-slate-800">AI Data Analyst</h2>
+            <p className="text-xs text-slate-500">Ask questions in plain English</p>
           </div>
         </div>
-        {chatHistory.length > 0 && (
+        <div className="flex items-center gap-1">
+          {chatHistory.length > 0 && (
+            <button
+              onClick={clearChatHistory}
+              className="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
+              title="Clear conversation"
+            >
+              <Trash2 size={15} />
+            </button>
+          )}
           <button
-            onClick={clearChatHistory}
-            className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-slate-600 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors border border-transparent hover:border-red-100"
-            title="Clear conversation"
+            onClick={toggleSize}
+            className="p-1.5 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-lg transition-colors"
+            title={chatPaneSize === 'expanded' ? 'Restore size' : 'Expand'}
           >
-            <Trash2 size={16} />
-            Clear Chat
+            {chatPaneSize === 'expanded' ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
           </button>
-        )}
+          <button
+            onClick={() => setChatPaneSize('minimized')}
+            className="p-1.5 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-lg transition-colors"
+            title="Minimize"
+          >
+            <Minus size={15} />
+          </button>
+        </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-6 space-y-6">
+      {/* Messages */}
+      <div className="flex-1 overflow-y-auto p-4 space-y-4">
         {chatHistory.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-full text-center space-y-6">
-            <div className="w-16 h-16 bg-emerald-100 rounded-full flex items-center justify-center text-emerald-500">
-              <Bot size={32} />
+          <div className="flex flex-col items-center justify-center h-full text-center space-y-5">
+            <div className="w-14 h-14 bg-emerald-100 rounded-full flex items-center justify-center text-emerald-500">
+              <Bot size={28} />
             </div>
             <div>
-              <h3 className="text-xl font-medium text-slate-800 mb-2">How can I help you analyze your data?</h3>
-              <p className="text-slate-500 max-w-md mx-auto">
+              <h3 className="text-lg font-medium text-slate-800 mb-1">How can I help you analyze your data?</h3>
+              <p className="text-slate-500 text-sm max-w-md mx-auto">
                 I can write ClickHouse queries, build charts, and find insights automatically.
               </p>
             </div>
             <div className="flex flex-wrap gap-2 justify-center max-w-lg">
               {suggestions.map((s, i) => (
-                <button 
+                <button
                   key={i}
                   onClick={() => setInput(s)}
-                  className="bg-white border border-slate-200 px-4 py-2 rounded-full text-sm text-slate-600 hover:border-emerald-500 hover:text-emerald-600 transition-colors shadow-sm flex items-center gap-2"
+                  className="bg-white border border-slate-200 px-3 py-1.5 rounded-full text-xs text-slate-600 hover:border-emerald-500 hover:text-emerald-600 transition-colors shadow-sm flex items-center gap-1.5"
                 >
-                  <History size={14} className="opacity-50" />
+                  <History size={12} className="opacity-50" />
                   {s}
                 </button>
               ))}
@@ -181,45 +197,70 @@ export function ChatPane() {
           </div>
         ) : (
           chatHistory.map((msg, i) => (
-            <motion.div 
-              initial={{ opacity: 0, y: 10 }}
+            <motion.div
+              initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
-              key={i} 
-              className={clsx("flex gap-4", msg.role === 'user' ? "flex-row-reverse" : "")}
+              key={i}
+              className={clsx("flex gap-3", msg.role === 'user' ? "flex-row-reverse" : "")}
             >
               <div className={clsx(
-                "w-8 h-8 rounded-full flex items-center justify-center shrink-0",
+                "w-7 h-7 rounded-full flex items-center justify-center shrink-0 text-xs font-bold",
                 msg.role === 'user' ? "bg-blue-500 text-white" : "bg-emerald-500 text-white"
               )}>
-                {msg.role === 'user' ? <User size={16} /> : <Bot size={16} />}
+                {msg.role === 'user' ? 'U' : <Bot size={14} />}
               </div>
               <div className={clsx(
-                "max-w-[80%] rounded-2xl p-4 shadow-sm",
-                msg.role === 'user' ? "bg-blue-500 text-white rounded-tr-none" : "bg-white border border-slate-200 text-slate-800 rounded-tl-none"
+                "max-w-[85%] rounded-2xl p-3 shadow-sm",
+                msg.role === 'user'
+                  ? "bg-blue-500 text-white rounded-tr-none"
+                  : "bg-white border border-slate-200 text-slate-800 rounded-tl-none"
               )}>
                 <p className="text-sm leading-relaxed whitespace-pre-wrap">{msg.content}</p>
-                {msg.sql && (
-                  <div className="mt-4 bg-slate-900 rounded-xl overflow-hidden border border-slate-800">
-                    <div className="flex items-center justify-between px-4 py-2 bg-slate-800/50 border-b border-slate-800">
-                      <span className="text-xs font-mono text-slate-400">Generated SQL</span>
-                      <div className="flex gap-2">
-                        <button 
-                          onClick={() => handleSaveToDashboard(msg.sql!, msg.visual || 'table', chatHistory[i-1]?.content)}
-                          className="flex items-center gap-1 text-xs bg-slate-700 hover:bg-slate-600 text-white px-3 py-1.5 rounded-md transition-colors font-medium"
+
+                {/* Clarification options */}
+                {msg.needs_clarification && msg.options && msg.options.length > 0 && (
+                  <div className="mt-3 space-y-2">
+                    <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">
+                      {msg.clarification_type === 'table_selection' ? 'Select a table:' : 'Select a field:'}
+                    </p>
+                    <div className="flex flex-wrap gap-2">
+                      {msg.options.map((opt, j) => (
+                        <button
+                          key={j}
+                          onClick={() => handleSend(opt)}
+                          className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded-lg text-xs font-medium transition-colors"
                         >
-                          <Save size={12} />
+                          <CheckSquare size={12} />
+                          {opt}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* SQL block */}
+                {msg.sql && (
+                  <div className="mt-3 bg-slate-900 rounded-xl overflow-hidden border border-slate-800">
+                    <div className="flex items-center justify-between px-3 py-2 bg-slate-800/50 border-b border-slate-800">
+                      <span className="text-xs font-mono text-slate-400">Generated SQL</span>
+                      <div className="flex gap-1.5">
+                        <button
+                          onClick={() => handleSaveToDashboard(msg.sql!, msg.visual || 'table', chatHistory[i - 1]?.content || 'Chat Query')}
+                          className="flex items-center gap-1 text-xs bg-slate-700 hover:bg-slate-600 text-white px-2.5 py-1 rounded-md transition-colors"
+                        >
+                          <Save size={11} />
                           Save
                         </button>
-                        <button 
-                          onClick={() => handleExecuteQuery(msg.sql!, chatHistory[i-1]?.content || 'Chat Query')}
-                          className="flex items-center gap-1 text-xs bg-emerald-500 hover:bg-emerald-400 text-white px-3 py-1.5 rounded-md transition-colors font-medium"
+                        <button
+                          onClick={() => handleExecuteQuery(msg.sql!, chatHistory[i - 1]?.content || 'Chat Query')}
+                          className="flex items-center gap-1 text-xs bg-emerald-500 hover:bg-emerald-400 text-white px-2.5 py-1 rounded-md transition-colors"
                         >
-                          <Play size={12} />
-                          Run Query
+                          <Play size={11} />
+                          Run
                         </button>
                       </div>
                     </div>
-                    <pre className="p-4 text-xs font-mono text-emerald-400 overflow-x-auto">
+                    <pre className="p-3 text-xs font-mono text-emerald-400 overflow-x-auto">
                       {msg.sql}
                     </pre>
                   </div>
@@ -229,20 +270,21 @@ export function ChatPane() {
           ))
         )}
         {isLoading && (
-          <div className="flex gap-4">
-            <div className="w-8 h-8 rounded-full bg-emerald-500 text-white flex items-center justify-center shrink-0">
-              <Bot size={16} />
+          <div className="flex gap-3">
+            <div className="w-7 h-7 rounded-full bg-emerald-500 text-white flex items-center justify-center shrink-0">
+              <Bot size={14} />
             </div>
-            <div className="bg-white border border-slate-200 rounded-2xl rounded-tl-none p-4 shadow-sm flex items-center gap-2">
-              <Loader2 className="animate-spin text-emerald-500" size={16} />
-              <span className="text-sm text-slate-500">Analyzing schema and generating SQL...</span>
+            <div className="bg-white border border-slate-200 rounded-2xl rounded-tl-none p-3 shadow-sm flex items-center gap-2">
+              <Loader2 className="animate-spin text-emerald-500" size={14} />
+              <span className="text-xs text-slate-500">Analyzing and generating SQL...</span>
             </div>
           </div>
         )}
         <div ref={messagesEndRef} />
       </div>
 
-      <div className="p-4 bg-white border-t border-slate-200">
+      {/* Input */}
+      <div className="p-3 bg-white border-t border-slate-200 shrink-0">
         <div className="relative flex items-center">
           <input
             type="text"
@@ -250,14 +292,14 @@ export function ChatPane() {
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && handleSend()}
             placeholder="Ask a question about your data..."
-            className="w-full bg-slate-50 border border-slate-200 rounded-full pl-6 pr-14 py-4 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all shadow-sm"
+            className="w-full bg-slate-50 border border-slate-200 rounded-full pl-5 pr-12 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all shadow-sm"
           />
           <button
-            onClick={handleSend}
+            onClick={() => handleSend()}
             disabled={!input.trim() || isLoading}
-            className="absolute right-2 p-2.5 bg-emerald-500 text-white rounded-full hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-sm"
+            className="absolute right-2 p-2 bg-emerald-500 text-white rounded-full hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-sm"
           >
-            <Send size={18} />
+            <Send size={16} />
           </button>
         </div>
       </div>
