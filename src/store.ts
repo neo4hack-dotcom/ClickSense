@@ -1,71 +1,147 @@
 import { create } from 'zustand';
 
-interface AppState {
-  currentUser: { id: number; name: string } | null;
-  setCurrentUser: (user: { id: number; name: string } | null) => void;
+export interface KnowledgeFolder {
+  id: number;
+  title: string;
+  content: string;
+  created_at: string;
+  updated_at: string;
+}
 
+export interface RagConfig {
+  esHost: string;
+  esIndex: string;
+  esUsername: string;
+  esPassword: string;
+  embeddingProvider: 'ollama' | 'http';
+  embeddingModel: string;
+  embeddingUrl: string;
+  embeddingApiKey: string;
+  topK: number;
+  chunkSize: number;
+}
+
+export interface RagMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  sources?: { title: string; score: number; excerpt: string }[];
+}
+
+interface AppState {
   schema: Record<string, { name: string; type: string }[]>;
   setSchema: (schema: Record<string, { name: string; type: string }[]>) => void;
-  
+
   tableMetadata: Record<string, { description: string; is_favorite: boolean }>;
   setTableMetadata: (meta: Record<string, { description: string; is_favorite: boolean }>) => void;
 
   selectedTable: string | null;
   setSelectedTable: (table: string | null) => void;
-  
+
   queryResult: any[];
   setQueryResult: (data: any[]) => void;
-  
+
   queryConfig: {
     dimensions: string[];
     measures: { column: string; agg: string }[];
     filters: { column: string; operator: string; value: string }[];
   };
   setQueryConfig: (config: any) => void;
-  
-  activeTab: 'chat' | 'builder' | 'dashboard' | 'settings' | 'knowledge';
-  setActiveTab: (tab: 'chat' | 'builder' | 'dashboard' | 'settings' | 'knowledge') => void;
-  
-  chatHistory: { role: 'user' | 'assistant'; content: string; sql?: string; visual?: string }[];
-  addChatMessage: (msg: { role: 'user' | 'assistant'; content: string; sql?: string; visual?: string }) => void;
+
+  activeTab: 'chat' | 'builder' | 'dashboard' | 'settings' | 'knowledge' | 'rag';
+  setActiveTab: (tab: 'chat' | 'builder' | 'dashboard' | 'settings' | 'knowledge' | 'rag') => void;
+
+  chatHistory: {
+    role: 'user' | 'assistant';
+    content: string;
+    sql?: string;
+    visual?: string;
+    needs_clarification?: boolean;
+    question?: string;
+    options?: string[];
+    clarification_type?: 'field_selection' | 'table_selection';
+  }[];
+  addChatMessage: (msg: {
+    role: 'user' | 'assistant';
+    content: string;
+    sql?: string;
+    visual?: string;
+    needs_clarification?: boolean;
+    question?: string;
+    options?: string[];
+    clarification_type?: 'field_selection' | 'table_selection';
+  }) => void;
   clearChatHistory: () => void;
+
+  chatPaneSize: 'normal' | 'expanded' | 'minimized';
+  setChatPaneSize: (size: 'normal' | 'expanded' | 'minimized') => void;
 
   savedQueries: any[];
   setSavedQueries: (queries: any[]) => void;
 
   queryHistory: any[];
   setQueryHistory: (history: any[]) => void;
+
+  knowledgeFolders: KnowledgeFolder[];
+  setKnowledgeFolders: (folders: KnowledgeFolder[]) => void;
+
+  ragConfig: RagConfig;
+  setRagConfig: (config: RagConfig) => void;
+
+  ragHistory: RagMessage[];
+  addRagMessage: (msg: RagMessage) => void;
+  clearRagHistory: () => void;
 }
 
 export const useAppStore = create<AppState>((set) => ({
-  currentUser: null,
-  setCurrentUser: (currentUser) => set({ currentUser }),
-
   schema: {},
   setSchema: (schema) => set({ schema }),
-  
+
   tableMetadata: {},
   setTableMetadata: (tableMetadata) => set({ tableMetadata }),
 
   selectedTable: null,
   setSelectedTable: (selectedTable) => set({ selectedTable }),
-  
+
   queryResult: [],
   setQueryResult: (queryResult) => set({ queryResult }),
-  
+
   queryConfig: { dimensions: [], measures: [], filters: [] },
   setQueryConfig: (queryConfig) => set({ queryConfig }),
-  
+
   activeTab: 'chat',
   setActiveTab: (activeTab) => set({ activeTab }),
-  
+
   chatHistory: [],
   addChatMessage: (msg) => set((state) => ({ chatHistory: [...state.chatHistory, msg] })),
   clearChatHistory: () => set({ chatHistory: [] }),
+
+  chatPaneSize: 'normal',
+  setChatPaneSize: (chatPaneSize) => set({ chatPaneSize }),
 
   savedQueries: [],
   setSavedQueries: (savedQueries) => set({ savedQueries }),
 
   queryHistory: [],
   setQueryHistory: (queryHistory) => set({ queryHistory }),
+
+  knowledgeFolders: [],
+  setKnowledgeFolders: (knowledgeFolders) => set({ knowledgeFolders }),
+
+  ragConfig: {
+    esHost: 'http://localhost:9200',
+    esIndex: 'clicksense_rag',
+    esUsername: '',
+    esPassword: '',
+    embeddingProvider: 'ollama',
+    embeddingModel: 'nomic-embed-text',
+    embeddingUrl: 'http://localhost:11434',
+    embeddingApiKey: '',
+    topK: 5,
+    chunkSize: 500,
+  },
+  setRagConfig: (ragConfig) => set({ ragConfig }),
+
+  ragHistory: [],
+  addRagMessage: (msg) => set((state) => ({ ragHistory: [...state.ragHistory, msg] })),
+  clearRagHistory: () => set({ ragHistory: [] }),
 }));
