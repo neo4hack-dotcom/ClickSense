@@ -57,22 +57,28 @@ interface AppState {
   chatHistory: {
     role: 'user' | 'assistant';
     content: string;
+    msg_type?: 'sql' | 'insight' | 'clarification';
     sql?: string;
     visual?: string;
     needs_clarification?: boolean;
     question?: string;
     options?: string[];
     clarification_type?: 'field_selection' | 'table_selection';
+    alternatives?: string[];
+    followup_suggestions?: string[];
   }[];
   addChatMessage: (msg: {
     role: 'user' | 'assistant';
     content: string;
+    msg_type?: 'sql' | 'insight' | 'clarification';
     sql?: string;
     visual?: string;
     needs_clarification?: boolean;
     question?: string;
     options?: string[];
     clarification_type?: 'field_selection' | 'table_selection';
+    alternatives?: string[];
+    followup_suggestions?: string[];
   }) => void;
   clearChatHistory: () => void;
 
