@@ -134,7 +134,7 @@ const SortableHeader: React.FC<{
     <th
       ref={setNodeRef}
       style={style}
-      className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider border-b border-slate-200 relative group select-none"
+      className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider border-b border-r border-slate-200 relative group select-none"
     >
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-1 cursor-pointer flex-1 overflow-hidden" onClick={() => onSort(column)}>
@@ -711,15 +711,15 @@ export function BuilderPane() {
       lookup[rk][ck] = row;
     });
     return (
-      <div className="flex-1 overflow-auto border border-slate-200 rounded-lg bg-white shadow-sm min-h-0">
-        <table className="w-full text-sm text-left">
+      <div className="flex-1 overflow-auto border border-slate-200 rounded-lg bg-white shadow-sm min-h-0" style={{ maxHeight: '100%' }}>
+        <table className="text-sm text-left" style={{ borderCollapse: 'separate', borderSpacing: 0 }}>
           <thead className="bg-slate-50 sticky top-0 z-10">
             <tr>
               {rowDims.map(d => (
                 <th key={d.name} className="px-4 py-3 text-xs font-bold uppercase tracking-wider border-b border-r border-slate-200 text-slate-600 bg-slate-100">{d.name}</th>
               ))}
               {uniqueColValues.map(cv => (
-                <th key={cv} className="px-4 py-3 text-xs font-bold uppercase tracking-wider border-b border-slate-200 text-purple-700 bg-purple-50 text-center" colSpan={measureKeys.length}>
+                <th key={cv} className="px-4 py-3 text-xs font-bold uppercase tracking-wider border-b border-r border-slate-200 text-purple-700 bg-purple-50 text-center" colSpan={measureKeys.length}>
                   {cv}
                 </th>
               ))}
@@ -735,7 +735,7 @@ export function BuilderPane() {
               </tr>
             )}
           </thead>
-          <tbody className="divide-y divide-slate-100">
+          <tbody className="divide-y divide-slate-200">
             {uniqueRowValues.map((rv, ri) => (
               <tr
                 key={rv}
@@ -756,7 +756,7 @@ export function BuilderPane() {
                     const cellData = lookup[rv]?.[cv];
                     const val = cellData ? cellData[mk] : null;
                     return (
-                      <td key={`${cv}-${mk}`} className="px-4 py-2.5 text-center text-slate-600 tabular-nums whitespace-nowrap">
+                      <td key={`${cv}-${mk}`} className="px-4 py-2.5 text-center text-slate-600 tabular-nums whitespace-nowrap border-r border-slate-200">
                         {val !== null && val !== undefined ? formatCellValue(val) : <span className="text-slate-300 text-xs">—</span>}
                       </td>
                     );
@@ -840,102 +840,120 @@ export function BuilderPane() {
 
       case 'bar':
         return (
-          <ResponsiveContainer width="100%" height={400}>
-            <BarChart data={queryResult}>
-              <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
-              <XAxis dataKey={dimKey} axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
-              <YAxis axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
-              <RechartsTooltip cursor={{ fill: '#f1f5f9' }} contentStyle={tooltipStyle} />
-              <Legend iconType="circle" wrapperStyle={{ fontSize: '12px' }} />
-              {measureKeys.map((key, i) => (
-                <Bar key={key} dataKey={key} fill={CHART_COLORS[i % CHART_COLORS.length]} radius={[4, 4, 0, 0]} />
-              ))}
-            </BarChart>
-          </ResponsiveContainer>
+          <div className="overflow-auto min-h-0 flex-1">
+            <div style={{ minWidth: Math.max(600, processedData.length * 40) }}>
+              <ResponsiveContainer width="100%" height={400}>
+                <BarChart data={processedData}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                  <XAxis dataKey={dimKey} axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
+                  <YAxis axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
+                  <RechartsTooltip cursor={{ fill: '#f1f5f9' }} contentStyle={tooltipStyle} />
+                  <Legend iconType="circle" wrapperStyle={{ fontSize: '12px' }} />
+                  {measureKeys.map((key, i) => (
+                    <Bar key={key} dataKey={key} fill={CHART_COLORS[i % CHART_COLORS.length]} radius={[4, 4, 0, 0]} />
+                  ))}
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
         );
 
       case 'line':
         return (
-          <ResponsiveContainer width="100%" height={400}>
-            <RechartsLineChart data={queryResult}>
-              <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
-              <XAxis dataKey={dimKey} axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
-              <YAxis axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
-              <RechartsTooltip contentStyle={tooltipStyle} />
-              <Legend iconType="circle" wrapperStyle={{ fontSize: '12px' }} />
-              {measureKeys.map((key, i) => (
-                <Line key={key} type="monotone" dataKey={key} stroke={CHART_COLORS[i % CHART_COLORS.length]} strokeWidth={3} dot={{ r: 4, strokeWidth: 2 }} activeDot={{ r: 6 }} />
-              ))}
-            </RechartsLineChart>
-          </ResponsiveContainer>
+          <div className="overflow-auto min-h-0 flex-1">
+            <div style={{ minWidth: Math.max(600, processedData.length * 40) }}>
+              <ResponsiveContainer width="100%" height={400}>
+                <RechartsLineChart data={processedData}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                  <XAxis dataKey={dimKey} axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
+                  <YAxis axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
+                  <RechartsTooltip contentStyle={tooltipStyle} />
+                  <Legend iconType="circle" wrapperStyle={{ fontSize: '12px' }} />
+                  {measureKeys.map((key, i) => (
+                    <Line key={key} type="monotone" dataKey={key} stroke={CHART_COLORS[i % CHART_COLORS.length]} strokeWidth={3} dot={{ r: 4, strokeWidth: 2 }} activeDot={{ r: 6 }} />
+                  ))}
+                </RechartsLineChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
         );
 
       case 'area':
         return (
-          <ResponsiveContainer width="100%" height={400}>
-            <RechartsAreaChart data={queryResult}>
-              <defs>
-                {measureKeys.map((key, i) => (
-                  <linearGradient key={key} id={`grad-${i}`} x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor={CHART_COLORS[i % CHART_COLORS.length]} stopOpacity={0.3} />
-                    <stop offset="95%" stopColor={CHART_COLORS[i % CHART_COLORS.length]} stopOpacity={0} />
-                  </linearGradient>
-                ))}
-              </defs>
-              <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
-              <XAxis dataKey={dimKey} axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
-              <YAxis axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
-              <RechartsTooltip contentStyle={tooltipStyle} />
-              <Legend iconType="circle" wrapperStyle={{ fontSize: '12px' }} />
-              {measureKeys.map((key, i) => (
-                <Area key={key} type="monotone" dataKey={key} stroke={CHART_COLORS[i % CHART_COLORS.length]} strokeWidth={2} fill={`url(#grad-${i})`} />
-              ))}
-            </RechartsAreaChart>
-          </ResponsiveContainer>
+          <div className="overflow-auto min-h-0 flex-1">
+            <div style={{ minWidth: Math.max(600, processedData.length * 40) }}>
+              <ResponsiveContainer width="100%" height={400}>
+                <RechartsAreaChart data={processedData}>
+                  <defs>
+                    {measureKeys.map((key, i) => (
+                      <linearGradient key={key} id={`grad-${i}`} x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor={CHART_COLORS[i % CHART_COLORS.length]} stopOpacity={0.3} />
+                        <stop offset="95%" stopColor={CHART_COLORS[i % CHART_COLORS.length]} stopOpacity={0} />
+                      </linearGradient>
+                    ))}
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                  <XAxis dataKey={dimKey} axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
+                  <YAxis axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
+                  <RechartsTooltip contentStyle={tooltipStyle} />
+                  <Legend iconType="circle" wrapperStyle={{ fontSize: '12px' }} />
+                  {measureKeys.map((key, i) => (
+                    <Area key={key} type="monotone" dataKey={key} stroke={CHART_COLORS[i % CHART_COLORS.length]} strokeWidth={2} fill={`url(#grad-${i})`} />
+                  ))}
+                </RechartsAreaChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
         );
 
       case 'pie':
         return (
-          <ResponsiveContainer width="100%" height={400}>
-            <RechartsPieChart>
-              <Pie data={queryResult} dataKey={measureKeys[0]} nameKey={dimKey} cx="50%" cy="50%" outerRadius={150} innerRadius={80} paddingAngle={2}>
-                {queryResult.map((_entry, index) => (
-                  <Cell key={`cell-${index}`} fill={CHART_COLORS[index % CHART_COLORS.length]} />
-                ))}
-              </Pie>
-              <RechartsTooltip contentStyle={tooltipStyle} />
-              <Legend iconType="circle" wrapperStyle={{ fontSize: '12px' }} />
-            </RechartsPieChart>
-          </ResponsiveContainer>
+          <div className="overflow-auto min-h-0 flex-1">
+            <ResponsiveContainer width="100%" height={420}>
+              <RechartsPieChart>
+                <Pie data={processedData} dataKey={measureKeys[0]} nameKey={dimKey} cx="50%" cy="50%" outerRadius={150} innerRadius={80} paddingAngle={2}>
+                  {processedData.map((_entry, index) => (
+                    <Cell key={`cell-${index}`} fill={CHART_COLORS[index % CHART_COLORS.length]} />
+                  ))}
+                </Pie>
+                <RechartsTooltip contentStyle={tooltipStyle} />
+                <Legend iconType="circle" wrapperStyle={{ fontSize: '12px' }} />
+              </RechartsPieChart>
+            </ResponsiveContainer>
+          </div>
         );
 
       case 'scatter':
         return (
-          <ResponsiveContainer width="100%" height={400}>
-            <RechartsScatterChart>
-              <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
-              <XAxis dataKey={measureKeys[0] || dimKey} name={measureKeys[0] || dimKey} axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
-              <YAxis dataKey={measureKeys[1] || measureKeys[0]} name={measureKeys[1] || measureKeys[0]} axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
-              <RechartsTooltip cursor={{ strokeDasharray: '3 3' }} contentStyle={tooltipStyle} />
-              <Scatter data={queryResult} fill={CHART_COLORS[0]} fillOpacity={0.7} />
-            </RechartsScatterChart>
-          </ResponsiveContainer>
+          <div className="overflow-auto min-h-0 flex-1">
+            <ResponsiveContainer width="100%" height={420}>
+              <RechartsScatterChart>
+                <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                <XAxis dataKey={measureKeys[0] || dimKey} name={measureKeys[0] || dimKey} axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
+                <YAxis dataKey={measureKeys[1] || measureKeys[0]} name={measureKeys[1] || measureKeys[0]} axisLine={false} tickLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
+                <RechartsTooltip cursor={{ strokeDasharray: '3 3' }} contentStyle={tooltipStyle} />
+                <Scatter data={processedData} fill={CHART_COLORS[0]} fillOpacity={0.7} />
+              </RechartsScatterChart>
+            </ResponsiveContainer>
+          </div>
         );
 
       case 'radar':
         return (
-          <ResponsiveContainer width="100%" height={400}>
-            <RadarChart data={queryResult} cx="50%" cy="50%" outerRadius={150}>
-              <PolarGrid stroke="#e2e8f0" />
-              <PolarAngleAxis dataKey={dimKey} tick={{ fill: '#64748b', fontSize: 12 }} />
-              <PolarRadiusAxis axisLine={false} tick={{ fill: '#94a3b8', fontSize: 10 }} />
-              {measureKeys.map((key, i) => (
-                <Radar key={key} name={key} dataKey={key} stroke={CHART_COLORS[i % CHART_COLORS.length]} fill={CHART_COLORS[i % CHART_COLORS.length]} fillOpacity={0.2} />
-              ))}
-              <Legend iconType="circle" wrapperStyle={{ fontSize: '12px' }} />
-              <RechartsTooltip contentStyle={tooltipStyle} />
-            </RadarChart>
-          </ResponsiveContainer>
+          <div className="overflow-auto min-h-0 flex-1">
+            <ResponsiveContainer width="100%" height={420}>
+              <RadarChart data={processedData} cx="50%" cy="50%" outerRadius={150}>
+                <PolarGrid stroke="#e2e8f0" />
+                <PolarAngleAxis dataKey={dimKey} tick={{ fill: '#64748b', fontSize: 12 }} />
+                <PolarRadiusAxis axisLine={false} tick={{ fill: '#94a3b8', fontSize: 10 }} />
+                {measureKeys.map((key, i) => (
+                  <Radar key={key} name={key} dataKey={key} stroke={CHART_COLORS[i % CHART_COLORS.length]} fill={CHART_COLORS[i % CHART_COLORS.length]} fillOpacity={0.2} />
+                ))}
+                <Legend iconType="circle" wrapperStyle={{ fontSize: '12px' }} />
+                <RechartsTooltip contentStyle={tooltipStyle} />
+              </RadarChart>
+            </ResponsiveContainer>
+          </div>
         );
 
       case 'table':
@@ -1017,8 +1035,8 @@ export function BuilderPane() {
               onDragEnd={(e) => handleDragEnd(e, 'columns')}
             >
               {/* Custom Table */}
-              <div className="flex-1 overflow-auto border border-slate-200 rounded-lg bg-white shadow-sm min-h-0">
-                <table className="w-full min-w-max text-sm text-left">
+              <div className="flex-1 overflow-auto border border-slate-200 rounded-lg bg-white shadow-sm min-h-0" style={{ maxHeight: '100%' }}>
+                <table className="min-w-max text-sm text-left" style={{ borderCollapse: 'separate', borderSpacing: 0 }}>
                   <thead className="bg-slate-50 sticky top-0 z-20 shadow-sm">
                     <tr>
                       <SortableContext items={keys} strategy={horizontalListSortingStrategy}>
@@ -1054,7 +1072,7 @@ export function BuilderPane() {
                       </tr>
                     )}
                   </thead>
-                  <tbody className="divide-y divide-slate-100">
+                  <tbody className="divide-y divide-slate-200">
                     {processedData.length > 0 ? (
                       processedData.map((row, i) => (
                         <tr
@@ -1073,7 +1091,7 @@ export function BuilderPane() {
                               color: col.text || undefined,
                             } : {};
                             return (
-                              <td key={key} className="px-4 py-2.5 whitespace-nowrap text-slate-600" style={style}>
+                              <td key={key} className="px-4 py-2.5 whitespace-nowrap text-slate-600 border-r border-slate-200" style={style}>
                                 {row[key] !== null && row[key] !== undefined ? formatCellValue(row[key]) : <span className="text-slate-300 italic">null</span>}
                               </td>
                             );
@@ -1348,21 +1366,6 @@ export function BuilderPane() {
             </div>
           </div>
 
-          {/* Metadata Editor */}
-          {selectedTable && (
-            <div className="p-4 border-b border-slate-200 shrink-0 bg-slate-50/50">
-              <div className="flex items-center justify-between mb-2">
-                <h3 className="text-sm font-semibold text-slate-800 truncate">Table Metadata</h3>
-              </div>
-              <textarea 
-                value={tableMetadata[selectedTable]?.description || ''}
-                onChange={(e) => updateDescription(selectedTable, e.target.value)}
-                placeholder="Describe this table functionally for the AI..."
-                className="w-full text-xs p-2 border border-slate-200 rounded-lg resize-none h-20 focus:ring-1 focus:ring-emerald-500 bg-white"
-              />
-            </div>
-          )}
-
           {/* Columns & Measures */}
           <div className="flex-1 overflow-y-auto p-4">
             {selectedTable && schema[selectedTable] && (
@@ -1553,6 +1556,45 @@ export function BuilderPane() {
                         </button>
                       ))}
                     </div>
+                    {queryResult && queryResult.length > 0 && (
+                      <>
+                        <div className="w-px h-6 bg-slate-200 mx-1"></div>
+                        <div className="flex items-center gap-1">
+                          <span className="text-xs text-slate-400 shrink-0">Sort:</span>
+                          <select
+                            value={sortConfig?.key || ''}
+                            onChange={e => {
+                              if (!e.target.value) { setSortConfig(null); return; }
+                              setSortConfig({ key: e.target.value, direction: sortConfig?.direction || 'asc' });
+                            }}
+                            className="text-xs border border-slate-200 rounded px-1.5 py-0.5 bg-white text-slate-700 outline-none focus:ring-1 focus:ring-emerald-500 max-w-[120px]"
+                          >
+                            <option value="">— none —</option>
+                            {(columnOrder.length > 0 ? columnOrder : Object.keys(queryResult[0])).map(k => (
+                              <option key={k} value={k}>{k}</option>
+                            ))}
+                          </select>
+                          {sortConfig && (
+                            <>
+                              <button
+                                onClick={() => setSortConfig({ key: sortConfig.key, direction: sortConfig.direction === 'asc' ? 'desc' : 'asc' })}
+                                className="p-1 rounded hover:bg-slate-100 text-slate-500"
+                                title={sortConfig.direction === 'asc' ? 'Ascending — click for descending' : 'Descending — click for ascending'}
+                              >
+                                {sortConfig.direction === 'asc' ? <ArrowUp size={13} /> : <ArrowDown size={13} />}
+                              </button>
+                              <button
+                                onClick={() => setSortConfig(null)}
+                                className="p-1 rounded hover:bg-slate-100 text-slate-400 hover:text-red-500"
+                                title="Clear sort"
+                              >
+                                <X size={12} />
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      </>
+                    )}
                     <div className="w-px h-6 bg-slate-200 mx-1"></div>
                     <button
                       onClick={() => setIsFullscreen(!isFullscreen)}
@@ -1563,7 +1605,7 @@ export function BuilderPane() {
                     </button>
                   </div>
                 </div>
-                <div className="p-6 flex-1 flex flex-col overflow-hidden">
+                <div className="p-4 flex-1 flex flex-col overflow-auto min-h-0">
                   {renderVisual()}
                 </div>
               </div>
