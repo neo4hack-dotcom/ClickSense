@@ -1271,6 +1271,105 @@ def execute_query():
 
 
 # ---------------------------------------------------------------------------
+# Similarity helpers for smart field disambiguation
+# ---------------------------------------------------------------------------
+import difflib as _difflib
+import re as _re2
+
+
+def _find_similar_fields(user_query: str, schema: dict, top_n: int = 10) -> list:
+    """Return the top-N schema fields whose names are similar to terms in the user query.
+
+    Uses substring matching and difflib sequence similarity.  Results are ranked
+    by similarity score and deduplicated.
+    """
+    # Stop-words to ignore when tokenising the query
+    _STOP = {
+        "le", "la", "les", "de", "du", "des", "un", "une", "et", "ou",
+        "the", "a", "an", "of", "in", "for", "by", "with", "on", "at",
+        "to", "me", "my", "show", "give", "list", "all", "from", "where",
+        "select", "que", "qui", "dans", "avec", "montrer", "afficher",
+        "donner", "lister", "tous", "toutes", "par", "is", "are", "what",
+        "how", "many", "much", "when", "which", "qui", "quels", "quelles",
+    }
+
+    query_terms = [
+        t.lower()
+        for t in _re2.findall(r"\w+", user_query.lower())
+        if t.lower() not in _STOP and len(t) > 2
+    ]
+
+    if not query_terms:
+        return []
+
+    results = []
+    seen: set = set()
+
+    for table, cols in schema.items():
+        for col in cols:
+            col_name = col["name"] if isinstance(col, dict) else col
+            col_type = col.get("type", "") if isinstance(col, dict) else ""
+            col_lower = col_name.lower()
+
+            best_score = 0.0
+            best_term = None
+            for term in query_terms:
+                if term == col_lower:
+                    score = 1.0
+                elif term in col_lower or col_lower in term:
+                    score = 0.85
+                else:
+                    score = _difflib.SequenceMatcher(None, term, col_lower).ratio()
+
+                if score > best_score:
+                    best_score = score
+                    best_term = term
+
+            if best_score >= 0.45:
+                key = f"{table}.{col_name}"
+                if key not in seen:
+                    seen.add(key)
+                    results.append({
+                        "table": table,
+                        "field": col_name,
+                        "type": col_type,
+                        "similarity": round(best_score, 3),
+                        "matched_term": best_term,
+                    })
+
+    results.sort(key=lambda x: x["similarity"], reverse=True)
+    return results[:top_n]
+
+
+def _find_date_field_candidates(schema: dict, table_filter: list = None) -> dict:
+    """Return a dict of table -> list of date/datetime column names.
+
+    Useful for explicit date-field disambiguation before calling the LLM.
+    """
+    DATE_KEYWORDS = {"date", "time", "datetime", "timestamp", "created", "updated",
+                     "at", "on", "day", "month", "year"}
+    result: dict = {}
+    for table, cols in schema.items():
+        if table_filter and table not in table_filter:
+            continue
+        date_cols = []
+        for col in cols:
+            col_name = col["name"] if isinstance(col, dict) else col
+            col_type = (col.get("type", "") if isinstance(col, dict) else "").lower()
+            col_lower = col_name.lower()
+            is_date_type = any(k in col_type for k in ("date", "datetime", "timestamp"))
+            is_date_name = any(k in col_lower for k in DATE_KEYWORDS)
+            if is_date_type or is_date_name:
+                date_cols.append({
+                    "name": col_name,
+                    "type": col.get("type", "") if isinstance(col, dict) else "",
+                })
+        if date_cols:
+            result[table] = date_cols
+    return result
+
+
+# ---------------------------------------------------------------------------
 # AI chat (SQL generation) with ambiguity detection
 # ---------------------------------------------------------------------------
 @app.route("/api/chat", methods=["POST"])
@@ -1300,15 +1399,56 @@ def chat():
     formatted_messages = [{"role": m["role"], "content": m["content"]} for m in messages]
 
     # ------------------------------------------------------------------
-    # Special case: "list all tables" → generate SQL directly, no need
-    # to send the full schema to the LLM (would be very token-expensive).
+    # Special case: "list all tables" → generate SQL directly
     # ------------------------------------------------------------------
     if _is_list_tables_request(messages):
         return jsonify({
+            "type": "sql",
             "sql": "SHOW TABLES",
             "explanation": "Lists all tables available in the current ClickHouse database.",
             "suggestedVisual": "table",
+            "alternatives": [],
+            "followup_suggestions": [],
         })
+
+    # ------------------------------------------------------------------
+    # Pre-search: find similar fields & date-field candidates
+    # This is done BEFORE the LLM call so we can include the results
+    # in the prompt and guide disambiguation.
+    # ------------------------------------------------------------------
+    last_user_msg = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            last_user_msg = m.get("content", "")
+            break
+
+    similar_fields = _find_similar_fields(last_user_msg, schema, top_n=10)
+    date_candidates = _find_date_field_candidates(
+        schema, table_filter=table_mapping_filter or None
+    )
+
+    # Build a compact note of similar fields for the prompt
+    similar_fields_note = ""
+    if similar_fields:
+        lines = [f"  - {sf['table']}.{sf['field']} ({sf['type']})  [score: {sf['similarity']}]"
+                 for sf in similar_fields]
+        similar_fields_note = (
+            "PRE-SEARCH — top similar fields found in schema (ranked by name similarity to user request):\n"
+            + "\n".join(lines)
+        )
+
+    # Build date disambiguation note
+    date_ambiguity_note = ""
+    for tbl, dcols in date_candidates.items():
+        if len(dcols) > 1:
+            col_list = ", ".join(f"{c['name']} ({c['type']})" for c in dcols)
+            date_ambiguity_note += f"  - Table `{tbl}` has multiple date/time fields: {col_list}\n"
+    if date_ambiguity_note:
+        date_ambiguity_note = (
+            "DATE FIELD AMBIGUITY — the following tables have multiple date/time columns. "
+            "If the user's request involves a date without specifying which one, ask for clarification:\n"
+            + date_ambiguity_note
+        )
 
     # Build a mapping note for the system prompt
     mapping_lines = []
@@ -1316,124 +1456,150 @@ def chat():
         if tbl in all_mappings:
             mapping_lines.append(f"  - {tbl}  →  \"{all_mappings[tbl]}\"")
     mapping_note = (
-        "The following tables have friendly business names. When communicating with the user use the friendly name, but always use the technical name in SQL:\n"
+        "The following tables have friendly business names. Use the friendly name with the user, but always use the technical name in SQL:\n"
         + "\n".join(mapping_lines)
     ) if mapping_lines else ""
 
     # ------------------------------------------------------------------
-    # Token budget: base prompt without dynamic content
+    # Token budget: estimate base size before dynamic content
     # ------------------------------------------------------------------
-    base_prompt_template = """You are an expert ClickHouse data analyst.
-Your goal is to help the user query their database.
-
-KNOWLEDGE BASE — CRITICAL:
-Before generating SQL or asking for clarification, you MUST consult the functional knowledge base provided.
-If the knowledge base contains a definition or mapping for a concept mentioned by the user
-(e.g., "a trade corresponds to a row in table toto"), use that information directly to build the SQL.
-Do NOT ask for clarification on a concept that is already explained in the knowledge base.
-
-AMBIGUITY HANDLING — CRITICAL:
-Before generating SQL, check if the user request is ambiguous:
-
-1. TABLE AMBIGUITY: If the user mentions a concept (e.g., "orders") but there are multiple tables that could match,
-   AND the knowledge base does not resolve which table to use,
-   return a clarification request instead of generating SQL.
-
-2. FIELD AMBIGUITY: If the user asks to display or use a field type (e.g., "date", "id", "name")
-   and there are MULTIPLE fields of that type in the same table,
-   AND the knowledge base does not indicate which field to use, return a clarification.
-
-When ambiguous, return ONLY this JSON:
-{
-  "needs_clarification": true,
-  "question": "Clear question in the user's language asking them to choose",
-  "options": ["option1", "option2", "option3"],
-  "type": "field_selection" | "table_selection"
-}
-
-CLICKHOUSE INSTRUCTIONS:
-- Use advanced ClickHouse functions when appropriate.
-- For funnels: windowFunnel(). For retention: retention(). For patterns: sequenceMatch().
-- For latest status: argMax(). For top-K: topK(). For unique counts: uniqHLL12().
-- For response times: quantilesTiming(). For JSON: JSONExtract(). For conditionals: sumIf(), countIf().
-- Always write highly optimized SQL.
-
-When NOT ambiguous, return ONLY this JSON:
-{
-  "sql": "SELECT ...",
-  "explanation": "Brief explanation of what the query does.",
-  "suggestedVisual": "table" | "bar" | "line" | "pie"
-}
-
-Do not include markdown formatting. Just the raw JSON.
-"""
+    base_prompt_skeleton = (
+        "You are an expert ClickHouse data analyst and proactive AI advisor.\n"
+        + similar_fields_note + date_ambiguity_note + mapping_note
+    )
     messages_tokens = sum(_estimate_tokens(m.get("content", "")) for m in formatted_messages)
-    base_tokens = _estimate_tokens(base_prompt_template) + _estimate_tokens(mapping_note) + messages_tokens
+    base_tokens = _estimate_tokens(base_prompt_skeleton) + messages_tokens + 300
+
+    # Log a warning if base tokens already look large
+    context_limit = _get_model_context_limit()
+    if base_tokens > context_limit * 0.8:
+        print(f"[Token budget] WARNING: base prompt already uses ~{base_tokens} tokens "
+              f"(limit {context_limit}). Schema/knowledge will be heavily truncated.")
 
     # Truncate dynamic context (schema / metadata / knowledge) to fit the budget
     schema, table_metadata, knowledge_context = _truncate_prompt_context(
         schema, table_metadata, knowledge_context, base_tokens
     )
 
-    system_prompt = f"""You are an expert ClickHouse data analyst.
-Your goal is to help the user query their database.
+    system_prompt = f"""You are an expert ClickHouse data analyst and proactive AI advisor.
+Your primary goal is always to produce an efficient, executable ClickHouse SQL query.
+You also provide insights, advice, and suggestions to help the user understand their data better.
 
-Here is the database schema:
+DATABASE SCHEMA:
 {json.dumps(schema, indent=2)}
 
-Here is the table metadata (functional descriptions):
+TABLE DESCRIPTIONS:
 {json.dumps(table_metadata, indent=2)}
 
 {mapping_note}
 
-Here is the functional knowledge base:
+KNOWLEDGE BASE:
 {knowledge_context}
 
-KNOWLEDGE BASE — CRITICAL:
-Before generating SQL or asking for clarification, you MUST consult the functional knowledge base above.
-If the knowledge base contains a definition or mapping for a concept mentioned by the user
-(e.g., "a trade corresponds to a row in table toto"), use that information directly to build the SQL.
-Do NOT ask for clarification on a concept that is already explained in the knowledge base.
+{similar_fields_note}
 
-AMBIGUITY HANDLING — CRITICAL:
-Before generating SQL, check if the user request is ambiguous:
+{date_ambiguity_note}
 
-1. TABLE AMBIGUITY: If the user mentions a concept (e.g., "orders") but there are multiple tables that could match,
-   AND the knowledge base does not resolve which table to use,
-   return a clarification request instead of generating SQL.
+════════════════════════════════════════
+BEHAVIORAL RULES (MANDATORY):
+════════════════════════════════════════
 
-2. FIELD AMBIGUITY: If the user asks to display or use a field type (e.g., "date", "id", "name")
-   and there are MULTIPLE fields of that type in the same table,
-   AND the knowledge base does not indicate which field to use, return a clarification.
+1. KNOWLEDGE BASE FIRST: Before generating SQL or asking for clarification, consult the knowledge base.
+   If it defines a concept the user mentioned (e.g., "a trade = row in table toto"), use that directly.
+   Never ask for clarification on something already explained in the knowledge base.
 
-When ambiguous, return ONLY this JSON:
+2. SMART DISAMBIGUATION:
+   a. TABLE AMBIGUITY: If the user's request maps to multiple tables and the knowledge base
+      doesn't resolve which one, return a clarification.
+   b. FIELD AMBIGUITY: If the user asks for a field type (e.g., "date", "id") and there are
+      multiple candidate fields in the table (see PRE-SEARCH and DATE FIELD AMBIGUITY above),
+      return a clarification listing all candidates.
+   c. Use the PRE-SEARCH results to propose realistic alternatives even when not strictly ambiguous.
+
+3. PROACTIVE BEHAVIOR:
+   - Always include 1-3 "alternatives" (different angles / approaches to the same question).
+   - Always include 1-3 "followup_suggestions" (natural next questions the user might want to ask).
+   - If the user asks a vague question, make a reasonable assumption, state it in the explanation,
+     AND still include alternatives covering other interpretations.
+   - When generating SQL, if you can also offer a useful insight, add it in the explanation.
+
+4. RESPONSE TYPE SELECTION:
+   - If the user asks a direct data question → type "sql"
+   - If the user asks for advice, best practices, or explanations → type "insight"
+   - If you need more information → type "clarification"
+
+5. CLICKHOUSE OPTIMIZATION:
+   - windowFunnel() for funnels, retention() for cohorts, sequenceMatch() for patterns
+   - argMax() for latest status, topK() for top-N, uniqHLL12() for approximate distinct counts
+   - quantilesTiming() for percentiles, JSONExtract() for JSON, sumIf()/countIf() for conditionals
+   - Always add LIMIT when appropriate. Avoid SELECT * on large tables.
+   - Prefer partition pruning via WHERE on date/partition keys.
+
+════════════════════════════════════════
+RESPONSE FORMAT (return ONLY valid JSON, no markdown):
+════════════════════════════════════════
+
+For a SQL query:
 {{
+  "type": "sql",
+  "sql": "SELECT ...",
+  "explanation": "What this query does and any assumptions made.",
+  "suggestedVisual": "table" | "bar" | "line" | "pie",
+  "alternatives": ["Alternative approach 1: ...", "Alternative: use field X instead of Y"],
+  "followup_suggestions": ["How many unique X per month?", "What is the trend over time?"]
+}}
+
+For insight / advice (no SQL needed):
+{{
+  "type": "insight",
+  "content": "Your explanation or advice here.",
+  "sql": "",
+  "suggestedVisual": "",
+  "alternatives": [],
+  "followup_suggestions": ["Related question 1", "Related question 2"]
+}}
+
+For clarification needed:
+{{
+  "type": "clarification",
   "needs_clarification": true,
   "question": "Clear question in the user's language asking them to choose",
-  "options": ["option1", "option2", "option3"],
-  "type": "field_selection" | "table_selection"
+  "options": ["option1 (description)", "option2 (description)"],
+  "clarification_type": "field_selection" | "table_selection",
+  "alternatives": [],
+  "followup_suggestions": []
 }}
-
-CLICKHOUSE INSTRUCTIONS:
-- Use advanced ClickHouse functions when appropriate.
-- For funnels: windowFunnel(). For retention: retention(). For patterns: sequenceMatch().
-- For latest status: argMax(). For top-K: topK(). For unique counts: uniqHLL12().
-- For response times: quantilesTiming(). For JSON: JSONExtract(). For conditionals: sumIf(), countIf().
-- Always write highly optimized SQL.
-
-When NOT ambiguous, return ONLY this JSON:
-{{
-  "sql": "SELECT ...",
-  "explanation": "Brief explanation of what the query does.",
-  "suggestedVisual": "table" | "bar" | "line" | "pie"
-}}
-
-Do not include markdown formatting. Just the raw JSON.
 """
 
     try:
         content = _call_llm(system_prompt, formatted_messages, temperature=0.3)
-        return jsonify(_parse_llm_json(content))
+        parsed = _parse_llm_json(content)
+
+        # ── Backward-compatibility normalisation ──────────────────────────
+        # Old LLM responses may not include "type". Infer it from the shape.
+        if "type" not in parsed:
+            if parsed.get("needs_clarification"):
+                parsed["type"] = "clarification"
+                # Old format used "type" for clarification_type; move it
+                if "clarification_type" not in parsed and "type" in parsed:
+                    parsed["clarification_type"] = parsed.get("type", "field_selection")
+            elif parsed.get("sql"):
+                parsed["type"] = "sql"
+            else:
+                parsed["type"] = "insight"
+
+        # Ensure clarification responses keep needs_clarification flag
+        if parsed.get("type") == "clarification":
+            parsed["needs_clarification"] = True
+            # Ensure clarification_type exists (old field was "type" inside the object)
+            if "clarification_type" not in parsed:
+                parsed["clarification_type"] = "field_selection"
+
+        # Ensure lists are present
+        parsed.setdefault("alternatives", [])
+        parsed.setdefault("followup_suggestions", [])
+
+        return jsonify(parsed)
 
     except Exception as exc:
         print(f"Chat error: {exc}")
@@ -1520,23 +1686,33 @@ def profile_table(table_name):
         total_rows = int(count_result.result_rows[0][0]) if count_result.result_rows else 0
 
         # 3. Single stats query: notnull count + distinct per column
-        # Use SAMPLE for large tables to keep it fast
-        sample_clause = " SAMPLE 0.1" if total_rows > 500_000 else ""
+        # For large tables try SAMPLE first; if the table doesn't have a sample key
+        # ClickHouse will raise an error — we fall back to a full-scan with a timeout.
+        use_sample = total_rows > 500_000
         select_parts = []
         for col in columns:
             cn = col["name"].replace("`", "``")
-            select_parts.append(f"countIf(`{cn}` IS NOT NULL) AS `{cn}__notnull`")
+            # Use isNotNull() — works for all types including non-nullable ones
+            select_parts.append(f"countIf(isNotNull(`{cn}`)) AS `{cn}__notnull`")
             select_parts.append(f"uniqExact(`{cn}`) AS `{cn}__distinct`")
 
         stats_row = {}
+        sampled = False
         if select_parts:
-            stats_sql = f"SELECT {', '.join(select_parts)} FROM `{table_name}`{sample_clause}"
-            try:
-                sr = client.query(stats_sql)
-                if sr.result_rows:
-                    stats_row = dict(zip(sr.column_names, sr.result_rows[0]))
-            except Exception as e:
-                print(f"Stats query warning: {e}")
+            for attempt_sample in ([True, False] if use_sample else [False]):
+                sample_clause = " SAMPLE 0.1" if attempt_sample else ""
+                stats_sql = f"SELECT {', '.join(select_parts)} FROM `{table_name}`{sample_clause}"
+                try:
+                    sr = client.query(stats_sql, settings={"max_execution_time": 30})
+                    if sr.result_rows:
+                        stats_row = dict(zip(sr.column_names, sr.result_rows[0]))
+                        sampled = attempt_sample
+                    break
+                except Exception as e:
+                    print(f"Stats query {'(with SAMPLE) ' if attempt_sample else ''}warning: {e}")
+                    if not attempt_sample:
+                        # Both attempts failed – proceed with empty stats_row (zeros)
+                        break
 
         # 4. Build per-column stats
         col_stats = []
@@ -1544,7 +1720,7 @@ def profile_table(table_name):
             cn = col["name"]
             notnull = int(stats_row.get(f"{cn}__notnull", 0))
             distinct = int(stats_row.get(f"{cn}__distinct", 0))
-            sample_factor = 10 if sample_clause else 1
+            sample_factor = 10 if sampled else 1
             estimated_rows = total_rows
             null_count = max(0, estimated_rows - notnull * sample_factor)
             null_pct = round(null_count / estimated_rows * 100, 1) if estimated_rows > 0 else 0.0

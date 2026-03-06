@@ -1,11 +1,35 @@
 import { useState, useRef, useEffect } from 'react';
 import {
   Send, Bot, Loader2, Sparkles, Play, Save, History, Trash2,
-  Maximize2, Minimize2, Minus, CheckSquare, Filter, X
+  Maximize2, Minimize2, Minus, CheckSquare, Filter, X,
+  Lightbulb, ArrowRight, Shuffle, ChevronDown, ChevronUp,
 } from 'lucide-react';
 import { useAppStore } from '../store';
 import clsx from 'clsx';
 import { motion, AnimatePresence } from 'motion/react';
+
+// Loading phase labels shown while the AI is working
+const LOADING_PHASES = [
+  { label: 'Recherche de champs similaires…', duration: 1200 },
+  { label: 'Analyse de la demande…', duration: 1000 },
+  { label: 'Génération de la réponse…', duration: 99999 },
+];
+
+function useLoadingPhase(isLoading: boolean) {
+  const [phaseIdx, setPhaseIdx] = useState(0);
+  useEffect(() => {
+    if (!isLoading) { setPhaseIdx(0); return; }
+    setPhaseIdx(0);
+    const timers: ReturnType<typeof setTimeout>[] = [];
+    let acc = 0;
+    LOADING_PHASES.slice(0, -1).forEach((p, i) => {
+      acc += p.duration;
+      timers.push(setTimeout(() => setPhaseIdx(i + 1), acc));
+    });
+    return () => timers.forEach(clearTimeout);
+  }, [isLoading]);
+  return LOADING_PHASES[phaseIdx]?.label ?? LOADING_PHASES[LOADING_PHASES.length - 1].label;
+}
 
 export function ChatPane() {
   const {
@@ -16,10 +40,12 @@ export function ChatPane() {
   } = useAppStore();
 
   const [filterOpen, setFilterOpen] = useState(false);
-
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  // Which messages have their alternatives/suggestions panel expanded
+  const [expandedAlts, setExpandedAlts] = useState<Set<number>>(new Set());
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const loadingPhaseLabel = useLoadingPhase(isLoading);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -57,32 +83,54 @@ export function ChatPane() {
       const data = await res.json();
 
       if (data.error) {
-        addChatMessage({ role: 'assistant', content: `Error: ${data.error}` });
-      } else if (data.needs_clarification) {
+        addChatMessage({ role: 'assistant', content: `Erreur : ${data.error}` });
+        return;
+      }
+
+      const responseType = data.type || (data.needs_clarification ? 'clarification' : data.sql ? 'sql' : 'insight');
+
+      if (responseType === 'clarification' || data.needs_clarification) {
         addChatMessage({
           role: 'assistant',
-          content: data.question || 'Could you be more specific?',
+          msg_type: 'clarification',
+          content: data.question || 'Pouvez-vous préciser votre demande ?',
           needs_clarification: true,
           question: data.question,
           options: data.options || [],
-          clarification_type: data.type || 'field_selection',
+          clarification_type: data.clarification_type || data.type || 'field_selection',
+          alternatives: data.alternatives || [],
+          followup_suggestions: data.followup_suggestions || [],
         });
-      } else {
+      } else if (responseType === 'insight') {
         addChatMessage({
           role: 'assistant',
-          content: data.explanation || 'Here is the query I generated:',
+          msg_type: 'insight',
+          content: data.content || data.explanation || 'Voici mon analyse :',
+          sql: data.sql || '',
+          visual: data.suggestedVisual || '',
+          alternatives: data.alternatives || [],
+          followup_suggestions: data.followup_suggestions || [],
+        });
+      } else {
+        // sql (default)
+        addChatMessage({
+          role: 'assistant',
+          msg_type: 'sql',
+          content: data.explanation || 'Voici la requête générée :',
           sql: data.sql,
-          visual: data.suggestedVisual
+          visual: data.suggestedVisual,
+          alternatives: data.alternatives || [],
+          followup_suggestions: data.followup_suggestions || [],
         });
       }
     } catch (error: any) {
-      addChatMessage({ role: 'assistant', content: `Failed to connect to AI: ${error.message}` });
+      addChatMessage({ role: 'assistant', content: `Impossible de contacter l'IA : ${error.message}` });
     } finally {
       setIsLoading(false);
     }
   };
 
-  const handleExecuteQuery = async (sql: string, queryText: string) => {
+  const handleExecuteQuery = async (sql: string) => {
     try {
       const res = await fetch('/api/query', {
         method: 'POST',
@@ -91,12 +139,12 @@ export function ChatPane() {
       });
       const data = await res.json();
       if (data.error) {
-        alert(`Query Error: ${data.error}`);
+        alert(`Erreur de requête : ${data.error}`);
       } else {
         setQueryResult(data.data);
       }
     } catch (error: any) {
-      alert(`Execution Error: ${error.message}`);
+      alert(`Erreur d'exécution : ${error.message}`);
     }
   };
 
@@ -107,23 +155,31 @@ export function ChatPane() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           user_id: 1,
-          name: name || "Saved from Chat",
+          name: name || "Sauvegardé depuis le Chat",
           sql,
           config: { dimensions: [], measures: [] },
           visual_type: visual || 'table'
         }),
       });
-      alert("Saved to dashboard!");
+      alert("Sauvegardé dans le tableau de bord !");
     } catch (e) {
       console.error(e);
-      alert("Failed to save");
+      alert("Échec de la sauvegarde");
     }
   };
 
+  const toggleAlts = (idx: number) => {
+    setExpandedAlts(prev => {
+      const next = new Set(prev);
+      next.has(idx) ? next.delete(idx) : next.add(idx);
+      return next;
+    });
+  };
+
   const defaultSuggestions = [
-    "Show me the list of all tables",
-    "Show me the list of fields for the table [table_name]",
-    "Search for the value '[value]' in the table [table_name]",
+    "Montre-moi la liste de toutes les tables",
+    "Quels sont les champs de la table [nom_table] ?",
+    "Recherche la valeur '[valeur]' dans la table [nom_table]",
   ];
 
   const suggestions = queryHistory.length > 0
@@ -137,7 +193,6 @@ export function ChatPane() {
     else setChatPaneSize('normal');
   };
 
-  // Only show mapped tables in the filter
   const mappedTables = tableMappings.filter(m => m.mapping_name);
   const toggleTableFilter = (tableName: string) => {
     if (selectedTableMappings.includes(tableName)) {
@@ -158,7 +213,7 @@ export function ChatPane() {
             </div>
             <div>
               <h2 className="text-base font-semibold text-slate-800">AI Data Analyst</h2>
-              <p className="text-xs text-slate-500">Ask questions in plain English</p>
+              <p className="text-xs text-slate-500">Posez vos questions en langage naturel</p>
             </div>
           </div>
           <div className="flex items-center gap-1">
@@ -171,7 +226,7 @@ export function ChatPane() {
                     ? "text-emerald-600 bg-emerald-50 hover:bg-emerald-100"
                     : "text-slate-400 hover:text-slate-700 hover:bg-slate-100"
                 )}
-                title="Filter by table scope"
+                title="Filtrer par table"
               >
                 <Filter size={15} />
                 {selectedTableMappings.length > 0 && (
@@ -185,7 +240,7 @@ export function ChatPane() {
               <button
                 onClick={clearChatHistory}
                 className="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
-                title="Clear conversation"
+                title="Effacer la conversation"
               >
                 <Trash2 size={15} />
               </button>
@@ -193,14 +248,14 @@ export function ChatPane() {
             <button
               onClick={toggleSize}
               className="p-1.5 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-lg transition-colors"
-              title={chatPaneSize === 'expanded' ? 'Restore size' : 'Expand'}
+              title={chatPaneSize === 'expanded' ? 'Réduire' : 'Agrandir'}
             >
               {chatPaneSize === 'expanded' ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
             </button>
             <button
               onClick={() => setChatPaneSize('minimized')}
               className="p-1.5 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-lg transition-colors"
-              title="Minimize"
+              title="Réduire"
             >
               <Minus size={15} />
             </button>
@@ -220,14 +275,14 @@ export function ChatPane() {
                 <div className="flex items-center justify-between mb-2">
                   <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide flex items-center gap-1.5">
                     <Filter size={11} />
-                    Restrict to tables
+                    Restreindre aux tables
                   </p>
                   {selectedTableMappings.length > 0 && (
                     <button
                       onClick={() => setSelectedTableMappings([])}
                       className="text-xs text-slate-400 hover:text-slate-600 flex items-center gap-1"
                     >
-                      <X size={11} /> Clear all
+                      <X size={11} /> Tout effacer
                     </button>
                   )}
                 </div>
@@ -244,7 +299,7 @@ export function ChatPane() {
                             ? "bg-emerald-500 text-white border-emerald-500"
                             : "bg-white text-slate-600 border-slate-200 hover:border-emerald-400 hover:text-emerald-600"
                         )}
-                        title={`Technical: ${m.table_name}`}
+                        title={`Technique : ${m.table_name}`}
                       >
                         {m.mapping_name}
                       </button>
@@ -253,7 +308,7 @@ export function ChatPane() {
                 </div>
                 {selectedTableMappings.length > 0 && (
                   <p className="mt-2 text-xs text-emerald-600">
-                    AI will only search in {selectedTableMappings.length} selected table{selectedTableMappings.length > 1 ? 's' : ''}.
+                    L'IA ne cherchera que dans {selectedTableMappings.length} table{selectedTableMappings.length > 1 ? 's' : ''} sélectionnée{selectedTableMappings.length > 1 ? 's' : ''}.
                   </p>
                 )}
               </div>
@@ -261,7 +316,7 @@ export function ChatPane() {
           )}
         </AnimatePresence>
 
-        {/* Active filter chips (always visible when filter active but panel closed) */}
+        {/* Active filter chips */}
         {!filterOpen && selectedTableMappings.length > 0 && (
           <div className="px-4 pb-2 flex flex-wrap gap-1.5 border-t border-slate-100 pt-2">
             {selectedTableMappings.map(tName => {
@@ -290,9 +345,9 @@ export function ChatPane() {
               <Bot size={28} />
             </div>
             <div>
-              <h3 className="text-lg font-medium text-slate-800 mb-1">How can I help you analyze your data?</h3>
+              <h3 className="text-lg font-medium text-slate-800 mb-1">Comment puis-je vous aider ?</h3>
               <p className="text-slate-500 text-sm max-w-md mx-auto">
-                I can write ClickHouse queries, build charts, and find insights automatically.
+                Je génère des requêtes ClickHouse, propose des analyses et des insights automatiques. Je mémorise le contexte de votre conversation.
               </p>
             </div>
             <div className="flex flex-wrap gap-2 justify-center max-w-lg">
@@ -316,25 +371,39 @@ export function ChatPane() {
               key={i}
               className={clsx("flex gap-3", msg.role === 'user' ? "flex-row-reverse" : "")}
             >
+              {/* Avatar */}
               <div className={clsx(
                 "w-7 h-7 rounded-full flex items-center justify-center shrink-0 text-xs font-bold",
                 msg.role === 'user' ? "bg-blue-500 text-white" : "bg-emerald-500 text-white"
               )}>
                 {msg.role === 'user' ? 'U' : <Bot size={14} />}
               </div>
+
+              {/* Bubble */}
               <div className={clsx(
                 "max-w-[85%] rounded-2xl p-3 shadow-sm",
                 msg.role === 'user'
                   ? "bg-blue-500 text-white rounded-tr-none"
-                  : "bg-white border border-slate-200 text-slate-800 rounded-tl-none"
+                  : msg.msg_type === 'insight'
+                    ? "bg-amber-50 border border-amber-200 text-slate-800 rounded-tl-none"
+                    : "bg-white border border-slate-200 text-slate-800 rounded-tl-none"
               )}>
+
+                {/* Insight badge */}
+                {msg.msg_type === 'insight' && msg.role === 'assistant' && (
+                  <div className="flex items-center gap-1.5 mb-2">
+                    <Lightbulb size={13} className="text-amber-500" />
+                    <span className="text-xs font-semibold text-amber-600 uppercase tracking-wide">Analyse & conseil</span>
+                  </div>
+                )}
+
                 <p className="text-sm leading-relaxed whitespace-pre-wrap">{msg.content}</p>
 
                 {/* Clarification options */}
                 {msg.needs_clarification && msg.options && msg.options.length > 0 && (
                   <div className="mt-3 space-y-2">
                     <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">
-                      {msg.clarification_type === 'table_selection' ? 'Select a table:' : 'Select a field:'}
+                      {msg.clarification_type === 'table_selection' ? 'Choisissez une table :' : 'Choisissez un champ :'}
                     </p>
                     <div className="flex flex-wrap gap-2">
                       {msg.options.map((opt, j) => (
@@ -355,21 +424,21 @@ export function ChatPane() {
                 {msg.sql && (
                   <div className="mt-3 bg-slate-900 rounded-xl overflow-hidden border border-slate-800">
                     <div className="flex items-center justify-between px-3 py-2 bg-slate-800/50 border-b border-slate-800">
-                      <span className="text-xs font-mono text-slate-400">Generated SQL</span>
+                      <span className="text-xs font-mono text-slate-400">SQL généré</span>
                       <div className="flex gap-1.5">
                         <button
                           onClick={() => handleSaveToDashboard(msg.sql!, msg.visual || 'table', chatHistory[i - 1]?.content || 'Chat Query')}
                           className="flex items-center gap-1 text-xs bg-slate-700 hover:bg-slate-600 text-white px-2.5 py-1 rounded-md transition-colors"
                         >
                           <Save size={11} />
-                          Save
+                          Sauver
                         </button>
                         <button
-                          onClick={() => handleExecuteQuery(msg.sql!, chatHistory[i - 1]?.content || 'Chat Query')}
+                          onClick={() => handleExecuteQuery(msg.sql!)}
                           className="flex items-center gap-1 text-xs bg-emerald-500 hover:bg-emerald-400 text-white px-2.5 py-1 rounded-md transition-colors"
                         >
                           <Play size={11} />
-                          Run
+                          Exécuter
                         </button>
                       </div>
                     </div>
@@ -378,18 +447,82 @@ export function ChatPane() {
                     </pre>
                   </div>
                 )}
+
+                {/* Alternatives & follow-up suggestions */}
+                {msg.role === 'assistant' && (
+                  (msg.alternatives?.length ?? 0) > 0 || (msg.followup_suggestions?.length ?? 0) > 0
+                ) && (
+                  <div className="mt-3">
+                    <button
+                      onClick={() => toggleAlts(i)}
+                      className="flex items-center gap-1 text-xs text-slate-400 hover:text-slate-600 transition-colors"
+                    >
+                      {expandedAlts.has(i) ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                      {expandedAlts.has(i) ? 'Masquer les suggestions' : 'Voir les alternatives & suggestions'}
+                    </button>
+
+                    <AnimatePresence>
+                      {expandedAlts.has(i) && (
+                        <motion.div
+                          initial={{ height: 0, opacity: 0 }}
+                          animate={{ height: 'auto', opacity: 1 }}
+                          exit={{ height: 0, opacity: 0 }}
+                          className="overflow-hidden"
+                        >
+                          <div className="mt-2 space-y-2">
+                            {(msg.alternatives?.length ?? 0) > 0 && (
+                              <div>
+                                <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1 flex items-center gap-1">
+                                  <Shuffle size={10} /> Alternatives
+                                </p>
+                                <div className="space-y-1">
+                                  {msg.alternatives!.map((alt, j) => (
+                                    <div key={j} className="text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 leading-relaxed">
+                                      {alt}
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                            {(msg.followup_suggestions?.length ?? 0) > 0 && (
+                              <div>
+                                <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1 flex items-center gap-1">
+                                  <ArrowRight size={10} /> Questions suivantes
+                                </p>
+                                <div className="flex flex-wrap gap-1.5">
+                                  {msg.followup_suggestions!.map((sug, j) => (
+                                    <button
+                                      key={j}
+                                      onClick={() => handleSend(sug)}
+                                      className="text-xs bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded-full px-2.5 py-1 transition-colors flex items-center gap-1"
+                                    >
+                                      <ArrowRight size={10} />
+                                      {sug}
+                                    </button>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+                  </div>
+                )}
               </div>
             </motion.div>
           ))
         )}
+
+        {/* Loading indicator with phase label */}
         {isLoading && (
           <div className="flex gap-3">
             <div className="w-7 h-7 rounded-full bg-emerald-500 text-white flex items-center justify-center shrink-0">
               <Bot size={14} />
             </div>
             <div className="bg-white border border-slate-200 rounded-2xl rounded-tl-none p-3 shadow-sm flex items-center gap-2">
-              <Loader2 className="animate-spin text-emerald-500" size={14} />
-              <span className="text-xs text-slate-500">Analyzing and generating SQL...</span>
+              <Loader2 className="animate-spin text-emerald-500 shrink-0" size={14} />
+              <span className="text-xs text-slate-500 animate-pulse">{loadingPhaseLabel}</span>
             </div>
           </div>
         )}
@@ -403,8 +536,8 @@ export function ChatPane() {
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleSend()}
-            placeholder="Ask a question about your data..."
+            onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSend()}
+            placeholder="Posez une question sur vos données…"
             className="w-full bg-slate-50 border border-slate-200 rounded-full pl-5 pr-12 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all shadow-sm"
           />
           <button
@@ -415,6 +548,9 @@ export function ChatPane() {
             <Send size={16} />
           </button>
         </div>
+        <p className="text-[10px] text-slate-400 text-center mt-1.5">
+          Le contexte de la conversation est mémorisé · Pre-recherche de champs activée
+        </p>
       </div>
     </div>
   );
