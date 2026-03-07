@@ -168,7 +168,7 @@ export function DataQualityPane() {
 
   const [selectedTable, setSelectedTable] = useState('');
   const [selectedColumns, setSelectedColumns] = useState<string[]>([]);
-  const [sampleSize, setSampleSize] = useState(50000);
+  const [sampleSize, setSampleSize] = useState<number | null>(50000);
   const [tableSearch, setTableSearch] = useState('');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [result, setResult] = useState<DQResult | null>(null);
@@ -333,15 +333,21 @@ export function DataQualityPane() {
             <div className="space-y-1.5">
               <label className="text-xs font-semibold text-slate-600 uppercase tracking-wide">Sample Size</label>
               <select
-                value={sampleSize}
-                onChange={e => setSampleSize(Number(e.target.value))}
+                value={sampleSize === null ? 'full' : String(sampleSize)}
+                onChange={e => setSampleSize(e.target.value === 'full' ? null : Number(e.target.value))}
                 className="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 focus:ring-2 focus:ring-violet-500/20 focus:border-violet-500 transition-all"
               >
                 <option value={10000}>10 000 rows</option>
                 <option value={50000}>50 000 rows</option>
                 <option value={100000}>100 000 rows</option>
                 <option value={500000}>500 000 rows</option>
+                <option value="full">Full scan (entire table)</option>
               </select>
+              {sampleSize === null && (
+                <p className="text-[10px] text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-2 py-1">
+                  Full scan reads every row — may be slow on large tables.
+                </p>
+              )}
             </div>
           )}
         </div>
@@ -361,7 +367,7 @@ export function DataQualityPane() {
           </button>
           {selectedColumns.length > 0 && !isAnalyzing && (
             <p className="text-center text-xs text-slate-400 mt-2">
-              {selectedColumns.length} column{selectedColumns.length > 1 ? 's' : ''} · {sampleSize.toLocaleString()} rows
+              {selectedColumns.length} column{selectedColumns.length > 1 ? 's' : ''} · {sampleSize === null ? 'full scan' : `${sampleSize.toLocaleString()} rows`}
             </p>
           )}
         </div>
