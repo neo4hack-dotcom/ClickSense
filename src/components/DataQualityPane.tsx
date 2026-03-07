@@ -97,7 +97,7 @@ interface VolumeAnalysis {
 
 interface DQResult {
   table: string;
-  sample_size: number;
+  sample_size: number | null;
   column_stats: ColumnStat[];
   analysis: DQAnalysis;
   volume_analysis?: VolumeAnalysis | null;
@@ -392,7 +392,7 @@ export function DataQualityPane() {
     <p style="font-size:13px;color:#475569;margin:0 0 12px;">${result.analysis.summary}</p>
     ${filterNote}
     <div style="display:flex;gap:16px;flex-wrap:wrap;">
-      <span style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:6px 14px;font-size:12px;"><strong>${result.sample_size.toLocaleString()}</strong> rows sampled</span>
+      <span style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:6px 14px;font-size:12px;"><strong>${result.sample_size != null ? result.sample_size.toLocaleString() + ' rows' : 'Full table'}</strong> sampled</span>
       <span style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:6px 14px;font-size:12px;"><strong>${result.column_stats.length}</strong> columns</span>
       ${criticalCount > 0 ? `<span style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:6px 14px;font-size:12px;color:#dc2626;"><strong>${criticalCount}</strong> critical issues</span>` : ''}
       ${issueCount > 0 ? `<span style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:6px 14px;font-size:12px;color:#d97706;"><strong>${issueCount}</strong> total issues</span>` : ''}
@@ -765,7 +765,7 @@ export function DataQualityPane() {
               <div className="flex gap-4 flex-wrap">
                 <div className="bg-slate-50 rounded-xl px-4 py-2 text-center">
                   <p className="text-xs text-slate-500">Sample</p>
-                  <p className="text-sm font-bold text-slate-800">{result.sample_size.toLocaleString()}</p>
+                  <p className="text-sm font-bold text-slate-800">{result.sample_size != null ? result.sample_size.toLocaleString() : 'Full table'}</p>
                 </div>
                 <div className="bg-slate-50 rounded-xl px-4 py-2 text-center">
                   <p className="text-xs text-slate-500">Columns</p>
