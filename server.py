@@ -2013,7 +2013,7 @@ def _dq_column_stats(
     stats: dict = {"column": column, "type": col_type}
     safe_table = _re.sub(r"[^\w.]", "", table)
     safe_col = _re.sub(r"[^\w]", "", column)
-    n = int(sample_size)
+    n = int(sample_size) if sample_size is not None else None
 
     # Build optional WHERE filter clause (injected inside the bounding subquery)
     where_clause = ""
@@ -2028,7 +2028,8 @@ def _dq_column_stats(
 
     # Subquery that limits input rows — this is the correct way to bound scans
     # on large tables in ClickHouse.  Every aggregate below queries this sub.
-    sub = f"(SELECT `{safe_col}` FROM {safe_table}{where_clause} LIMIT {n})"
+    limit_clause = f" LIMIT {n}" if n is not None else ""
+    sub = f"(SELECT `{safe_col}` FROM {safe_table}{where_clause}{limit_clause})"
 
     try:
         # ── Basic counts ──────────────────────────────────────────────────────
@@ -2192,7 +2193,8 @@ def analyze_data_quality():
     data = request.get_json()
     table = (data.get("table") or "").strip()
     columns = data.get("columns", [])
-    sample_size = min(int(data.get("sample_size", 50000)), 500000)
+    _sample_raw = data.get("sample_size")
+    sample_size = min(int(_sample_raw), 500000) if _sample_raw is not None else None
     # Optional row filter
     filter_col = (data.get("filter_column") or "").strip() or None
     filter_op = (data.get("filter_operator") or "=").strip()
@@ -2217,6 +2219,17 @@ def analyze_data_quality():
     allowed_ops = {"=", "!=", "<", ">", "<=", ">=", "LIKE"}
     if filter_op not in allowed_ops:
         filter_op = "="
+
+    safe_table = _re.sub(r"[^\w.]", "", table)
+
+    # Build filter WHERE clause used both for per-column stats and volume analysis
+    where_clause = ""
+    if filter_col and filter_op and filter_val is not None:
+        safe_fcol = _re.sub(r"[^\w]", "", filter_col)
+        escaped_val = str(filter_val).replace("'", "''")
+        op_map = {"=": "=", "!=": "!=", "<": "<", ">": ">", "<=": "<=", ">=": ">=", "LIKE": "LIKE"}
+        op = op_map.get(filter_op, "=")
+        where_clause = f" WHERE `{safe_fcol}` {op} '{escaped_val}'"
 
     try:
         client = get_clickhouse_client()
@@ -2254,11 +2267,13 @@ def analyze_data_quality():
                 granularity = "hour" if delta_days <= 7 else "day"
                 trunc_fn = "toStartOfHour" if granularity == "hour" else "toStartOfDay"
 
-                where_vol = where_clause if where_clause else ""
+                if where_clause:
+                    where_vol = where_clause + f" AND `{safe_time_col}` IS NOT NULL"
+                else:
+                    where_vol = f" WHERE `{safe_time_col}` IS NOT NULL"
                 vol_r = client.query(
                     f"SELECT {trunc_fn}(`{safe_time_col}`) AS period, count() AS cnt"
                     f" FROM {safe_table}{where_vol}"
-                    f" WHERE `{safe_time_col}` IS NOT NULL"
                     f" GROUP BY period ORDER BY period"
                 )
                 vol_rows = [{"period": str(row[0]), "count": int(row[1])} for row in vol_r.result_rows]
@@ -2364,7 +2379,7 @@ Return ONLY valid JSON with this exact structure:
 
         return jsonify({
             "table": table,
-            "sample_size": sample_size,
+            "sample_size": sample_size,  # None when full scan (no LIMIT)
             "column_stats": column_stats,
             "analysis": analysis,
             "volume_analysis": volume_analysis,
