@@ -1,5 +1,7 @@
 import os
 import json
+import uuid
+import re
 import requests as http_requests
 import urllib3
 from datetime import datetime, timezone
@@ -2558,6 +2560,9 @@ def import_config():
 # Agents system
 # ---------------------------------------------------------------------------
 
+# In-memory session store for the ClickHouse Writer agent
+_writer_sessions: dict = {}
+
 AGENTS_CATALOG = [
     {
         "id": "data-dictionary",
@@ -2599,6 +2604,39 @@ AGENTS_CATALOG = [
             },
         ],
     },
+    {
+        "id": "clickhouse-writer",
+        "name": "ClickHouse Writer Agent",
+        "description": (
+            "Agent autonome capable d'enchaîner jusqu'à 12 opérations complexes en lecture ET "
+            "écriture sur ClickHouse. Planifie ses actions, crée des tables intermédiaires (BOT_*), "
+            "se réévalue toutes les 3 étapes, pose des questions si nécessaire et produit une "
+            "synthèse complète avec réflexion."
+        ),
+        "parameters": [
+            {
+                "name": "database",
+                "label": "Base de données",
+                "type": "string",
+                "default": "",
+                "description": "Nom de la base ClickHouse (vide = base par défaut)",
+            },
+            {
+                "name": "max_actions",
+                "label": "Nombre max d'actions",
+                "type": "number",
+                "default": 12,
+                "description": "Budget maximum d'actions successives (1-12)",
+            },
+            {
+                "name": "sample_preview",
+                "label": "Lignes de prévisualisation",
+                "type": "number",
+                "default": 5,
+                "description": "Nombre de lignes à afficher par résultat intermédiaire",
+            },
+        ],
+    },
 ]
 
 
@@ -2613,7 +2651,620 @@ def agent_chat(agent_id):
     """Dispatch a chat message to the requested agent."""
     if agent_id == "data-dictionary":
         return _run_data_dictionary_agent()
+    if agent_id == "clickhouse-writer":
+        return _run_clickhouse_writer_agent()
     return jsonify({"error": f"Agent '{agent_id}' introuvable."}), 404
+
+
+@app.route("/api/agents/clickhouse-writer/cleanup", methods=["POST"])
+def clickhouse_writer_cleanup():
+    """Drop all BOT_ tables for a given session."""
+    data = request.get_json(silent=True) or {}
+    session_id = data.get("session_id", "")
+    session = _writer_sessions.get(session_id, {})
+    created_tables = session.get("created_tables", [])
+    database = session.get("database", clickhouse_config.get("database", "default"))
+    try:
+        client = get_clickhouse_client()
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+    dropped, errors = [], []
+    for table in created_tables:
+        try:
+            client.command(f"DROP TABLE IF EXISTS `{database}`.`{table}`")
+            dropped.append(table)
+        except Exception as exc:
+            errors.append(f"{table}: {str(exc)}")
+    if session_id in _writer_sessions:
+        _writer_sessions[session_id]["created_tables"] = [
+            t for t in created_tables if t not in dropped
+        ]
+    return jsonify({"dropped": dropped, "errors": errors})
+
+
+# ===========================================================================
+# ClickHouse Writer Agent — helper functions
+# ===========================================================================
+
+def _cw_get_schema_info(client, database: str, max_tables: int = 30) -> str:
+    """Return a compact schema overview (tables + columns + row counts)."""
+    try:
+        res = client.query(f"SHOW TABLES FROM `{database}`")
+        tables = [row[0] for row in res.result_rows]
+    except Exception as exc:
+        return f"Impossible de lister les tables: {exc}"
+
+    parts = []
+    for tbl in tables[:max_tables]:
+        try:
+            desc = client.query(f"DESCRIBE TABLE `{database}`.`{tbl}`")
+            cols = ", ".join(f"{r[0]}:{r[1]}" for r in desc.result_rows[:15])
+            try:
+                cnt_res = client.query(f"SELECT count() FROM `{database}`.`{tbl}`")
+                cnt = cnt_res.result_rows[0][0] if cnt_res.result_rows else "?"
+            except Exception:
+                cnt = "?"
+            parts.append(f"TABLE {tbl} ({cnt} rows): {cols}")
+        except Exception as exc:
+            parts.append(f"TABLE {tbl}: (erreur schema: {exc})")
+
+    if len(tables) > max_tables:
+        parts.append(f"... et {len(tables) - max_tables} autres tables.")
+    return "\n".join(parts)
+
+
+def _cw_detect_bot_table(sql: str) -> str | None:
+    """Extract the BOT_ table name from a CREATE TABLE statement."""
+    m = re.search(r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:`[^`]+`\.)?`?(BOT_\w+)`?",
+                  sql, re.IGNORECASE)
+    return m.group(1) if m else None
+
+
+def _cw_plan(user_request: str, database: str, schema_info: str) -> dict:
+    """LLM generates a detailed execution plan."""
+    system_prompt = (
+        "Tu es un expert ClickHouse et architecte de données senior. "
+        "Tu analyses des demandes complexes et crées des plans d'exécution précis et efficaces. "
+        "Tu penses comme un ingénieur senior qui doit traiter de très grandes tables. "
+        "Tu réponds UNIQUEMENT avec du JSON valide, sans markdown ni texte supplémentaire."
+    )
+    user_content = (
+        f"Base de données: {database}\n\n"
+        f"Tables disponibles:\n{schema_info}\n\n"
+        f"Demande de l'utilisateur: {user_request}\n\n"
+        "Crée un plan d'exécution détaillé avec AU MAXIMUM 12 étapes pour réaliser cette demande.\n"
+        "Tu peux créer des tables intermédiaires (MUST start with BOT_) pour les calculs complexes.\n"
+        "Sois stratégique: identifie les données nécessaires, les transformations requises, "
+        "les vérifications à faire.\n\n"
+        "Réponds UNIQUEMENT avec ce JSON:\n"
+        "{\n"
+        '  "objective": "description claire de l\'objectif",\n'
+        '  "approach": "approche haut niveau expliquée",\n'
+        '  "estimated_steps": N,\n'
+        '  "complexity": "simple|medium|complex|very_complex",\n'
+        '  "steps": [\n'
+        "    {\n"
+        '      "id": 1,\n'
+        '      "description": "ce que cette étape accomplit",\n'
+        '      "type": "explore|compute|create_table|insert|verify|aggregate|cleanup",\n'
+        '      "rationale": "pourquoi cette étape est nécessaire",\n'
+        '      "creates_table": null\n'
+        "    }\n"
+        "  ]\n"
+        "}"
+    )
+    raw = _call_llm(system_prompt, [{"role": "user", "content": user_content}], temperature=0.1)
+    result = _parse_llm_json(raw)
+    if not result or "steps" not in result:
+        result = {
+            "objective": user_request,
+            "approach": "Exécution directe de la demande utilisateur.",
+            "estimated_steps": 1,
+            "complexity": "simple",
+            "steps": [{"id": 1, "description": "Exécuter la demande", "type": "compute",
+                        "rationale": "Réponse directe", "creates_table": None}],
+        }
+    # Enforce max 12 steps
+    result["steps"] = result["steps"][:12]
+    return result
+
+
+def _cw_generate_sql(session: dict, step: dict, client, database: str) -> dict:
+    """LLM generates the SQL query (or a question) for a given plan step."""
+    plan = session["plan"]
+    action_log = session["action_log"]
+    user_context = session.get("user_context", {})
+
+    prev_summaries = []
+    for entry in action_log[-4:]:
+        status_str = "✓ SUCCÈS" if entry["ok"] else "✗ ECHEC"
+        preview = str(entry.get("result_preview", ""))[:300]
+        prev_summaries.append(
+            f"Étape {entry['step_id']} ({status_str}): {entry['description']}\n"
+            f"  SQL: {str(entry.get('sql', ''))[:200]}\n"
+            f"  Résultat: {preview}"
+        )
+
+    try:
+        res = client.query(f"SHOW TABLES FROM `{database}`")
+        all_tables = [row[0] for row in res.result_rows]
+    except Exception:
+        all_tables = []
+
+    system_prompt = (
+        "Tu es un expert SQL ClickHouse en train d'exécuter une étape d'un plan d'analyse. "
+        "Tu écris du SQL ClickHouse efficace et correct. "
+        "Tu es précis et tiens compte des volumes de données. "
+        "Tu réponds UNIQUEMENT avec du JSON valide, sans markdown ni texte supplémentaire."
+    )
+    user_content = (
+        f"Base: {database} | Tables disponibles: {', '.join(all_tables)}\n\n"
+        f"Objectif global: {plan.get('objective', '')}\n"
+        f"Approche: {plan.get('approach', '')}\n\n"
+        f"Étape actuelle {step['id']}/{len(plan.get('steps', []))}: {step['description']}\n"
+        f"Type: {step.get('type', 'compute')} | "
+        f"Crée une table: {step.get('creates_table', 'non')}\n"
+        f"Raison: {step.get('rationale', '')}\n\n"
+        f"Résultats des étapes précédentes:\n"
+        + ("\n".join(prev_summaries) if prev_summaries else "  (première étape)\n")
+        + f"\n\nContexte fourni par l'utilisateur: {json.dumps(user_context, ensure_ascii=False)}\n\n"
+        "Génère le SQL pour cette étape.\n"
+        "Règles OBLIGATOIRES:\n"
+        "- Tables temporaires: TOUJOURS préfixées BOT_ (ex: BOT_aggreg_results)\n"
+        "- Syntaxe ClickHouse valide uniquement\n"
+        "- Pour grandes tables: utilise LIMIT ou SAMPLE pour les explorations\n"
+        "- CREATE TABLE: utilise ENGINE = MergeTree() ORDER BY tuple() si pas d'ordre naturel\n"
+        "- Pour INSERT: INSERT INTO `db`.`BOT_table` SELECT ...\n"
+        "- Si tu dois choisir entre plusieurs options et que l'utilisateur doit décider: "
+        "pose une question avec des choix\n\n"
+        "Réponds UNIQUEMENT avec ce JSON:\n"
+        "{\n"
+        '  "sql": "ta requête SQL ici",\n'
+        '  "explanation": "ce que cette requête fait et pourquoi",\n'
+        '  "creates_table": null,\n'
+        '  "needs_user_input": false,\n'
+        '  "question": null\n'
+        "}\n\n"
+        "Si needs_user_input est true, mets sql à null et question à:\n"
+        "{\n"
+        '  "text": "Question à poser à l\'utilisateur",\n'
+        '  "choices": [{"label": "Description option", "value": "valeur"}]\n'
+        "}"
+    )
+    raw = _call_llm(system_prompt, [{"role": "user", "content": user_content}], temperature=0.05)
+    result = _parse_llm_json(raw)
+    if not result:
+        step_id = step["id"]
+        step_desc = step["description"]
+        return {
+            "sql": f"SELECT '{step_id}' AS step_id, '{step_desc}' AS description",
+            "explanation": "Fallback SQL (parsing LLM échoué)",
+            "creates_table": None,
+            "needs_user_input": False,
+            "question": None,
+        }
+    return result
+
+
+def _cw_replan(session: dict, remaining_credits: int) -> dict:
+    """LLM re-evaluates the plan every 3 steps and adjusts if needed."""
+    plan = session["plan"]
+    action_log = session["action_log"]
+    current_idx = session["action_index"]
+
+    results_summary = []
+    for entry in action_log:
+        results_summary.append(
+            f"Étape {entry['step_id']} ({'OK' if entry['ok'] else 'ECHEC'}): "
+            f"{entry['description']} → {str(entry.get('result_preview', ''))[:200]}"
+        )
+
+    remaining_steps = [s for s in plan.get("steps", []) if s["id"] > current_idx]
+    next_id = current_idx + 1
+
+    system_prompt = (
+        "Tu es un analyste stratégique réévaluant un plan d'exécution à mi-parcours. "
+        "Tu décides si le plan est encore optimal ou s'il faut l'adapter. "
+        "Tu réponds UNIQUEMENT avec du JSON valide, sans markdown."
+    )
+    user_content = (
+        f"Objectif: {plan.get('objective', '')}\n"
+        f"Approche originale: {plan.get('approach', '')}\n\n"
+        f"Crédits restants (actions max): {remaining_credits}\n\n"
+        f"Résultats obtenus jusqu'ici:\n" + "\n".join(results_summary) + "\n\n"
+        f"Étapes restantes prévues:\n{json.dumps(remaining_steps, ensure_ascii=False, indent=2)}\n\n"
+        "Réévalue: Le plan actuel est-il encore optimal compte tenu des résultats?\n"
+        "Considère:\n"
+        "1. Les résultats sont-ils conformes aux attentes?\n"
+        "2. Des étapes ont-elles échoué ou produit des données inattendues?\n"
+        "3. Peut-on atteindre l'objectif plus efficacement?\n"
+        "4. Faut-il ajouter des étapes basées sur ce qu'on a découvert?\n\n"
+        "Réponds UNIQUEMENT avec:\n"
+        "{\n"
+        '  "should_replan": false,\n'
+        '  "reason": "explication de la décision",\n'
+        '  "new_remaining_steps": null\n'
+        "}\n"
+        f"Si should_replan est true, fournis new_remaining_steps: tableau d'au plus "
+        f"{remaining_credits} étapes avec id (commençant à {next_id}), description, type, "
+        "rationale, creates_table."
+    )
+    raw = _call_llm(system_prompt, [{"role": "user", "content": user_content}], temperature=0.1)
+    result = _parse_llm_json(raw)
+    if not result:
+        return {"should_replan": False, "reason": "Pas de réévaluation nécessaire."}
+    return result
+
+
+def _cw_synthesize(session: dict) -> dict:
+    """LLM generates a comprehensive synthesis of the entire operation."""
+    plan = session["plan"]
+    action_log = session["action_log"]
+    created_tables = session.get("created_tables", [])
+    replan_log = session.get("replan_log", [])
+
+    log_detail = []
+    for entry in action_log:
+        log_detail.append({
+            "step_id": entry["step_id"],
+            "description": entry["description"],
+            "sql_preview": str(entry.get("sql", ""))[:400],
+            "ok": entry["ok"],
+            "result_preview": str(entry.get("result_preview", ""))[:400],
+            "rows": entry.get("rows_affected"),
+            "explanation": entry.get("explanation", ""),
+        })
+
+    replan_summary = [
+        f"Après étape {i*3+3}: {r.get('reason', '')} (replanifié: {r.get('should_replan', False)})"
+        for i, r in enumerate(replan_log)
+    ]
+
+    system_prompt = (
+        "Tu es un analyste senior rédigeant un rapport de synthèse complet et perspicace. "
+        "Tu expliques des opérations techniques complexes de façon claire, avec des insights métier. "
+        "Ta synthèse doit être précieuse à la fois pour les profils techniques et métier. "
+        "Tu réponds UNIQUEMENT avec du JSON valide, sans markdown ni texte superflu."
+    )
+    user_content = (
+        f"Objectif: {plan.get('objective', '')}\n"
+        f"Approche: {plan.get('approach', '')}\n\n"
+        f"Journal d'exécution:\n{json.dumps(log_detail, ensure_ascii=False, indent=2)}\n\n"
+        f"Réévaluations du plan:\n" + ("\n".join(replan_summary) if replan_summary else "Aucune réévaluation.") + "\n\n"
+        f"Tables temporaires créées: {', '.join(created_tables) if created_tables else 'aucune'}\n\n"
+        "Génère une synthèse complète et détaillée.\n"
+        "Réponds UNIQUEMENT avec:\n"
+        "{\n"
+        '  "executive_summary": "résumé exécutif 2-3 phrases de ce qui a été accompli",\n'
+        '  "key_findings": ["découverte 1", "découverte 2", "..."],\n'
+        '  "step_reflections": [\n'
+        "    {\n"
+        '      "step_id": 1,\n'
+        '      "description": "description de l\'étape",\n'
+        '      "outcome": "ce qui s\'est passé",\n'
+        '      "insight": "ce que ça révèle sur les données",\n'
+        '      "status": "success|failed|partial"\n'
+        "    }\n"
+        "  ],\n"
+        '  "data_insights": "observations analytiques approfondies sur les patterns découverts",\n'
+        '  "recommendations": ["recommandation 1", "recommandation 2"],\n'
+        '  "conclusion": "conclusion finale et prochaines étapes suggérées",\n'
+        '  "tables_created": [{"name": "BOT_xxx", "purpose": "contenu", "useful_for": "usages futurs"}]\n'
+        "}"
+    )
+    raw = _call_llm(system_prompt, [{"role": "user", "content": user_content}], temperature=0.3)
+    result = _parse_llm_json(raw)
+    if not result:
+        return {
+            "executive_summary": f"Analyse complétée en {len(action_log)} étapes.",
+            "key_findings": [e["description"] for e in action_log if e["ok"]],
+            "step_reflections": [],
+            "data_insights": "",
+            "recommendations": [],
+            "conclusion": "Analyse terminée.",
+            "tables_created": [{"name": t, "purpose": "Table intermédiaire", "useful_for": ""}
+                                for t in created_tables],
+        }
+    return result
+
+
+def _cw_execute_steps(session: dict, client, database: str, preview_rows: int = 5) -> dict:
+    """
+    Core execution loop: runs plan steps until done, needs user input, or max actions reached.
+    Returns a response dict ready to be jsonified.
+    """
+    plan = session["plan"]
+    steps = plan.get("steps", [])
+    max_actions = session.get("max_actions", 12)
+
+    while (session["action_index"] < len(steps)
+           and session["action_count"] < max_actions):
+
+        step = steps[session["action_index"]]
+
+        # ── Generate SQL via LLM ──────────────────────────────────────────
+        sql_result = _cw_generate_sql(session, step, client, database)
+
+        # ── Agent needs user input: pause and return question ─────────────
+        if sql_result.get("needs_user_input"):
+            session["status"] = "asking_user"
+            session["pending_step_index"] = session["action_index"]
+            return {
+                "content": (
+                    f"⏸ L'agent a besoin d'une clarification avant l'étape {step['id']}: "
+                    f"{step['description']}"
+                ),
+                "status": "asking_user",
+                "plan": plan,
+                "action_log": session["action_log"],
+                "action_count": session["action_count"],
+                "remaining_credits": max_actions - session["action_count"],
+                "question": sql_result["question"],
+                "created_tables": session["created_tables"],
+            }
+
+        # ── Execute SQL ───────────────────────────────────────────────────
+        sql = (sql_result.get("sql") or "").strip()
+        entry = {
+            "step_id": step["id"],
+            "description": step["description"],
+            "sql": sql,
+            "ok": False,
+            "result_preview": None,
+            "rows_affected": None,
+            "explanation": sql_result.get("explanation", ""),
+        }
+
+        if not sql:
+            entry["ok"] = False
+            entry["result_preview"] = "SQL vide généré par le LLM."
+        else:
+            sql_upper = sql.lstrip().upper()
+            is_read = any(sql_upper.startswith(k) for k in
+                          ("SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH"))
+            try:
+                if is_read:
+                    res = client.query(sql)
+                    rows = _rows_to_dicts(res)
+                    entry["ok"] = True
+                    entry["result_preview"] = rows[:preview_rows]
+                    entry["rows_affected"] = len(rows)
+                else:
+                    client.command(sql)
+                    entry["ok"] = True
+                    entry["result_preview"] = "Commande exécutée avec succès."
+                    entry["rows_affected"] = None
+                    # Track BOT_ table creation
+                    bot_table = (sql_result.get("creates_table")
+                                 or _cw_detect_bot_table(sql))
+                    if bot_table and bot_table not in session["created_tables"]:
+                        session["created_tables"].append(bot_table)
+            except Exception as exc:
+                entry["ok"] = False
+                entry["result_preview"] = f"Erreur: {str(exc)}"
+
+        session["action_log"].append(entry)
+        session["action_index"] += 1
+        session["action_count"] += 1
+
+        # ── Replan check every 3 actions ──────────────────────────────────
+        remaining_credits = max_actions - session["action_count"]
+        if (session["action_count"] % 3 == 0
+                and session["action_index"] < len(steps)
+                and remaining_credits > 0):
+            replan = _cw_replan(session, remaining_credits)
+            replan["checked_after_step"] = session["action_count"]
+            session["replan_log"].append(replan)
+
+            if replan.get("should_replan") and replan.get("new_remaining_steps"):
+                completed = [s for s in steps if s["id"] <= step["id"]]
+                new_remaining = replan["new_remaining_steps"][:remaining_credits]
+                plan["steps"] = completed + new_remaining
+                plan["replan_note"] = (
+                    f"Réévalué après étape {session['action_count']}: "
+                    + replan.get("reason", "")
+                )
+                session["plan"] = plan
+                steps = plan["steps"]
+
+    # ── All steps done (or max reached): synthesize ───────────────────────
+    synthesis = _cw_synthesize(session)
+    session["synthesis"] = synthesis
+    session["status"] = "awaiting_cleanup"
+
+    cleanup_question = None
+    if session["created_tables"]:
+        cleanup_question = {
+            "text": (
+                f"L'agent a créé {len(session['created_tables'])} table(s) temporaire(s): "
+                f"{', '.join(session['created_tables'])}. "
+                "Souhaitez-vous les supprimer maintenant?"
+            ),
+            "choices": [
+                {"label": "Oui — supprimer toutes les tables BOT_", "value": "delete"},
+                {"label": "Non — les conserver pour des analyses futures", "value": "keep"},
+            ],
+        }
+
+    return {
+        "content": (
+            f"✅ Analyse terminée en {session['action_count']} action(s) "
+            f"({'/' + str(max_actions) + ' max'}). "
+            "Voici la synthèse complète ci-dessous."
+        ),
+        "status": "awaiting_cleanup" if session["created_tables"] else "done",
+        "plan": plan,
+        "action_log": session["action_log"],
+        "action_count": session["action_count"],
+        "remaining_credits": max_actions - session["action_count"],
+        "synthesis": synthesis,
+        "created_tables": session["created_tables"],
+        "replan_log": session["replan_log"],
+        "question": cleanup_question,
+    }
+
+
+# ---------------------------------------------------------------------------
+# ClickHouse Writer Agent — main handler
+# ---------------------------------------------------------------------------
+
+def _run_clickhouse_writer_agent():
+    """
+    ClickHouse Writer Agent.
+
+    Autonomous agent that plans and executes up to 12 sequential ClickHouse
+    operations (read + write), re-evaluates its plan every 3 steps, asks the
+    user clarifying questions when needed, creates BOT_* intermediate tables,
+    and delivers a comprehensive reflective synthesis.
+
+    Request body (JSON):
+        messages      – conversation history [{role, content}]
+        params        – agent parameters (database, max_actions, sample_preview)
+        session_id    – (optional) resume an existing session
+
+    Response (JSON):
+        content        – human-readable message
+        status         – planning|executing|asking_user|awaiting_cleanup|done
+        plan           – execution plan
+        action_log     – per-step execution details
+        action_count   – number of actions executed so far
+        remaining_credits – actions remaining
+        synthesis      – final synthesis (when done)
+        created_tables – list of BOT_* tables created
+        question       – optional {text, choices} for user interaction
+        replan_log     – history of plan re-evaluations
+        session_id     – session identifier to include in next request
+    """
+    data = request.get_json(silent=True) or {}
+    messages = data.get("messages", [])
+    params = data.get("params", {})
+    session_id = data.get("session_id", "")
+
+    # ── Resolve parameters ────────────────────────────────────────────────
+    database = (
+        (params.get("database") or "").strip()
+        or clickhouse_config.get("database", "default")
+    )
+    try:
+        max_actions = max(1, min(int(params.get("max_actions", 12)), 12))
+    except (TypeError, ValueError):
+        max_actions = 12
+    try:
+        preview_rows = max(1, min(int(params.get("sample_preview", 5)), 20))
+    except (TypeError, ValueError):
+        preview_rows = 5
+
+    # ── Session management ────────────────────────────────────────────────
+    if not session_id or session_id not in _writer_sessions:
+        session_id = str(uuid.uuid4())
+        session = {
+            "status": "new",
+            "database": database,
+            "max_actions": max_actions,
+            "plan": None,
+            "action_index": 0,
+            "action_count": 0,
+            "action_log": [],
+            "created_tables": [],
+            "replan_log": [],
+            "synthesis": None,
+            "user_context": {},
+            "pending_step_index": None,
+        }
+        _writer_sessions[session_id] = session
+    else:
+        session = _writer_sessions[session_id]
+
+    status = session["status"]
+    user_message = messages[-1]["content"].strip() if messages else ""
+
+    # ── ClickHouse connection ─────────────────────────────────────────────
+    try:
+        client = get_clickhouse_client()
+    except Exception as exc:
+        return jsonify({
+            "error": f"Connexion ClickHouse impossible: {exc}",
+            "session_id": session_id,
+        }), 500
+
+    db = session["database"]
+
+    # ── State machine ─────────────────────────────────────────────────────
+    if status == "new":
+        # Phase 1: explore schema & generate plan
+        session["status"] = "executing"
+        try:
+            schema_info = _cw_get_schema_info(client, db)
+        except Exception as exc:
+            schema_info = f"Erreur lors de la récupération du schéma: {exc}"
+
+        plan = _cw_plan(user_message, db, schema_info)
+        session["plan"] = plan
+
+        result = _cw_execute_steps(session, client, db, preview_rows)
+
+    elif status in ("executing",):
+        result = _cw_execute_steps(session, client, db, preview_rows)
+
+    elif status == "asking_user":
+        # User answered a question: store answer and resume
+        step_idx = session.get("pending_step_index", session["action_index"])
+        session["user_context"][f"answer_step_{step_idx}"] = user_message
+        session["status"] = "executing"
+        result = _cw_execute_steps(session, client, db, preview_rows)
+
+    elif status == "awaiting_cleanup":
+        affirmative = any(w in user_message.lower()
+                          for w in ["oui", "yes", "delete", "supprimer", "ok", "confirme", "1"])
+        if affirmative:
+            dropped, errors = [], []
+            for table in list(session["created_tables"]):
+                try:
+                    client.command(f"DROP TABLE IF EXISTS `{db}`.`{table}`")
+                    dropped.append(table)
+                except Exception as exc:
+                    errors.append(f"{table}: {str(exc)}")
+            session["status"] = "done"
+            session["created_tables"] = [t for t in session["created_tables"]
+                                          if t not in dropped]
+            dropped_txt = ", ".join(dropped) if dropped else "aucune"
+            error_txt = f" (erreurs: {'; '.join(errors)})" if errors else ""
+            result = {
+                "content": (
+                    f"🗑️ Tables supprimées: {dropped_txt}{error_txt}. "
+                    "La session est terminée."
+                ),
+                "status": "done",
+                "cleanup_done": True,
+                "tables_dropped": dropped,
+                "synthesis": session.get("synthesis"),
+                "plan": session.get("plan"),
+                "action_log": session["action_log"],
+            }
+        else:
+            session["status"] = "done"
+            result = {
+                "content": (
+                    "✅ Tables BOT_ conservées. Vous pouvez les utiliser pour des analyses futures. "
+                    "La session est terminée."
+                ),
+                "status": "done",
+                "cleanup_done": False,
+                "created_tables": session["created_tables"],
+                "synthesis": session.get("synthesis"),
+                "plan": session.get("plan"),
+                "action_log": session["action_log"],
+            }
+
+    else:
+        result = {
+            "content": "Session terminée. Démarrez une nouvelle conversation.",
+            "status": "done",
+        }
+
+    _writer_sessions[session_id] = session
+    result["session_id"] = session_id
+    return jsonify(result)
 
 
 def _run_data_dictionary_agent():
