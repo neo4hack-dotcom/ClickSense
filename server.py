@@ -648,6 +648,21 @@ def _messages_to_prompt(system_prompt: str, messages: list) -> str:
     return "\n\n".join(parts)
 
 
+def _check_llm_content_for_errors(content: str, label: str = "LLM") -> None:
+    """Raise a clear exception when the API proxy forwards an HTTP error as content.
+
+    Some API gateways return HTTP 200 with an error message such as
+    "Error: 400 Client Error: Bad Request for url: ..." in the response body
+    instead of a proper JSON error. This causes a confusing "not valid JSON"
+    error downstream, so we detect and re-raise it early with a clear message.
+    """
+    import re as _re
+    if content and _re.match(r"^Error:\s+\d{3}\s+(Client|Server)\s+Error:", content.strip()):
+        raise Exception(
+            f"{label} API returned an HTTP error as response content: {content.strip()[:500]}"
+        )
+
+
 def _call_llm(system_prompt: str, messages: list, temperature: float = 0.7,
               language: str = None) -> str:
     """Call the configured LLM and return the content string.
@@ -675,7 +690,7 @@ def _call_llm(system_prompt: str, messages: list, temperature: float = 0.7,
 
     if provider == "local_http":
         endpoint = base_url or "http://localhost:8000"
-        if "/v1/chat" not in endpoint:
+        if not any(s in endpoint for s in ("/v1/chat", "/v2/chat", "/chat/completions")):
             endpoint = endpoint.rstrip("/") + "/v1/chat/completions"
         headers = {"Content-Type": "application/json"}
         if llm_config.get("apiKey"):
@@ -699,6 +714,8 @@ def _call_llm(system_prompt: str, messages: list, temperature: float = 0.7,
             or resp_data.get("content")
             or ""
         )
+        # Detect HTTP error messages forwarded as content by API proxies/gateways
+        _check_llm_content_for_errors(content, "local_http LLM")
         return _clean_llm_output(_strip_llm_markdown(content))
 
     elif provider == "ollama":
