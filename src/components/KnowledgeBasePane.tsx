@@ -91,9 +91,24 @@ export function KnowledgeBasePane() {
   };
 
   // Table mapping helpers
+
+  // Returns the bare table name without DB prefix (e.g. "mydb.orders" → "orders")
+  const getBareTableName = (tableName: string) => {
+    const dotIdx = tableName.indexOf('.');
+    return dotIdx !== -1 ? tableName.slice(dotIdx + 1) : tableName;
+  };
+
   const getMappingName = (tableName: string) => {
-    const saved = tableMappings.find(m => m.table_name === tableName);
-    return saved?.mapping_name ?? '';
+    // Exact match first (handles both "table" and "db.table" keys)
+    const exact = tableMappings.find(m => m.table_name === tableName);
+    if (exact) return exact.mapping_name;
+    // Backward-compat fallback: old mappings saved without DB prefix
+    const bare = getBareTableName(tableName);
+    if (bare !== tableName) {
+      const legacy = tableMappings.find(m => m.table_name === bare);
+      if (legacy) return legacy.mapping_name;
+    }
+    return '';
   };
 
   const getEditingValue = (tableName: string) => {
@@ -110,11 +125,21 @@ export function KnowledgeBasePane() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ table_name: tableName, mapping_name: mappingName }),
       });
+      // Also remove any legacy bare-name entry to avoid duplicates
+      const bare = getBareTableName(tableName);
+      const legacyExists = bare !== tableName && tableMappings.some(m => m.table_name === bare);
+      if (legacyExists) {
+        await fetch('/api/table-mappings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ table_name: bare, mapping_name: '' }),
+        });
+      }
       if (mappingName) {
-        const updated = tableMappings.filter(m => m.table_name !== tableName);
+        const updated = tableMappings.filter(m => m.table_name !== tableName && m.table_name !== bare);
         setTableMappings([...updated, { table_name: tableName, mapping_name: mappingName }]);
       } else {
-        setTableMappings(tableMappings.filter(m => m.table_name !== tableName));
+        setTableMappings(tableMappings.filter(m => m.table_name !== tableName && m.table_name !== bare));
       }
       setEditingMappings(prev => { const n = { ...prev }; delete n[tableName]; return n; });
       setSavedTable(tableName);
